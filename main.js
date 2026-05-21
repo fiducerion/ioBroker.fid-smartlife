@@ -1,0 +1,979 @@
+/* iobroker.fid-smartlife - main.js
+ *
+ * Cloud-First Tuya/Smartlife Adapter. Portiert vom TuyaCloudReplace v2.5.2-Skript.
+ *
+ * Lifecycle:
+ *   1. onReady: Config laden, Cloud-Client erstellen, Discovery
+ *   2. Pro Geraet: Spec laden, States anlegen, initialen Status holen
+ *   3. Subscriptions setzen (alle .* States auf Write hoeren)
+ *   4. Periodisches Polling alle pollIntervalSec
+ *   5. Periodische Rediscovery alle rediscoverIntervalMin
+ *
+ * State-Layout:
+ *   fid-smartlife.0.<deviceId>._name          Anzeigename
+ *   fid-smartlife.0.<deviceId>.online         Cloud-online
+ *   fid-smartlife.0.<deviceId>._noCloudStatusPoll  pro Geraet abschaltbar
+ *   fid-smartlife.0.<deviceId>.<dpCanon>      pro DP ein State
+ *   fid-smartlife.0.<deviceId>.on             Alias (wenn ableitbar)
+ *   fid-smartlife.0.<deviceId>.brightness     Alias
+ *   fid-smartlife.0.<deviceId>.color_temp_k   Alias
+ *   ...
+ */
+'use strict';
+
+const utils      = require('@iobroker/adapter-core');
+const TuyaCloud  = require('./lib/tuyaCloud');
+const tuyaLocal  = require('./lib/tuyaLocal');
+const lanDiscovery = require('./lib/lanDiscovery');
+const sm         = require('./lib/specMapper');
+
+class FiducerionSmartlife extends utils.Adapter {
+
+  constructor(options) {
+    super(Object.assign({}, options, { name: 'fid-smartlife' }));
+    this.on('ready',         this.onReady.bind(this));
+    this.on('unload',        this.onUnload.bind(this));
+    this.on('stateChange',   this.onStateChange.bind(this));
+
+    /** @type {TuyaCloud|null} */
+    this.cloud = null;
+
+    /** Map deviceId -> { name, defs, alias, dpMeta, canonToReal, noCloudStatusPoll, local, raw } */
+    this.devices = new Map();
+
+    /** Set zur Erkennung von Writes die wir selber gerade schreiben (Optimistic ACK)
+     *  damit wir nicht in einer Schleife enden. */
+    this.ignoreNextChange = new Set();
+
+    /** Debounce-Timer pro <deviceId>::<codeCanon> */
+    this.writeTimers = Object.create(null);
+
+    /** LAN-Discovery: cached records by deviceId, falls Gerät vor Cloud-Discovery announced */
+    this.discoveryCache = Object.create(null);
+
+    /** LAN-Discovery-Listener-Handle */
+    this.lanListener = null;
+
+    /** Lifecycle */
+    this.pollTimer    = null;
+    this.rediscoverTimer = null;
+    this.shuttingDown = false;
+  }
+
+  async onReady() {
+    // ==== Self-Check: sind die kritischen Files alle da? ====
+    // Wenn ein OS-Update / apt-Hook npm-prune ausgeloest hat, sind Teile von
+    // node_modules weg. Hart abbrechen statt sich durchwurschteln.
+    if (!this._selfCheck()) {
+      this.terminate ? this.terminate('Self-check failed', 13) : process.exit(13);
+      return;
+    }
+
+    try {
+      await this.setStateAsync('info.connection', { val: false, ack: true });
+
+      const cfg = this.config || {};
+      if (!cfg.clientId || !cfg.clientSecret) {
+        this.log.error('Bitte Tuya Access ID + Access Secret in der Adapter-Konfiguration eintragen.');
+        return;
+      }
+
+      // Falls clientSecret aus einer alten io-package.json mit encryptedNative verschluesselt
+      // ist, hier nachtraeglich entschluesseln. Bei neueren io-packages (ohne encryptedNative)
+      // ist this.config.clientSecret bereits Klartext.
+      let secret = String(cfg.clientSecret || '');
+      try {
+        if (typeof this.getEncryptedConfig === 'function' && secret.length > 0) {
+          const decrypted = await this.getEncryptedConfig('clientSecret', secret).catch(() => null);
+          if (decrypted && decrypted !== secret && decrypted.length > 0) {
+            this.log.debug('clientSecret war verschluesselt, entschluesselt fuer Cloud-Auth');
+            secret = decrypted;
+          }
+        }
+      } catch (e) { /* fallthrough mit ggf. verschluesseltem secret - Cloud-Call wird dann scheitern und der User sieht den Fehler */ }
+
+      // No-poll Liste parsen
+      this.noPollSet = new Set(
+        String(cfg.noCloudStatusPollIds || '').split(',')
+          .map(s => s.trim()).filter(Boolean)
+      );
+
+      this.cloud = new TuyaCloud({
+        clientId: cfg.clientId,
+        clientSecret: secret,
+        region: cfg.region || 'eu',
+        requestTimeoutMs: Number(cfg.requestTimeoutMs) || 12000,
+        logger: (lvl, msg) => this.log[lvl] && this.log[lvl]('[cloud] ' + msg)
+      });
+
+      // Commands-States subscriben (Buttons im Admin)
+      this.subscribeStates('commands.*');
+      // Alle Geraete-States subscriben (Schreibbefehle vom User)
+      // Wir filtern in onStateChange selbst nach writable + nicht-leading-underscore.
+      this.subscribeStates('*');
+
+      // LAN-Discovery starten (laeuft im Hintergrund parallel zur Cloud-Discovery)
+      if (cfg.enableLanDiscovery !== false) {
+        this.lanListener = lanDiscovery.start({
+          onRecord: (rec) => this.onLanDiscoveryRecord(rec).catch(e => this.log.debug('LAN-record: ' + e.message)),
+          logger: (lvl, msg) => this.log[lvl] && this.log[lvl]('[lan] ' + msg)
+        });
+      }
+
+      this.log.info('Starte Discovery ...');
+      await this.discoverAll();
+
+      // Lokale IPs aus iobroker.tuya importieren falls Adapter parallel laeuft
+      if (cfg.importLocalFromTuyaAdapter !== false) {
+        await this.importLocalFromTuyaAdapter();
+      }
+
+      await this.setStateAsync('info.connection', { val: true, ack: true });
+      this.log.info('Initial-Setup fertig: ' + this.devices.size + ' Geraete');
+
+      // Periodisches Polling
+      const pollMs = Math.max(10, Number(cfg.pollIntervalSec) || 60) * 1000;
+      this.pollTimer = this.setInterval(() => this.pollAll().catch(e => this.log.warn('Poll-Cycle: ' + e.message)), pollMs);
+
+      // Periodische Rediscovery
+      const rdMin = Number(cfg.rediscoverIntervalMin);
+      if (rdMin && rdMin > 0) {
+        this.rediscoverTimer = this.setInterval(() => {
+          this.log.info('Periodische Rediscovery ...');
+          this.discoverAll().catch(e => this.log.warn('Rediscover: ' + e.message));
+        }, rdMin * 60 * 1000);
+      }
+
+    } catch (e) {
+      this.log.error('onReady fehlgeschlagen: ' + (e && e.stack || e));
+      await this.setStateAsync('info.connection', { val: false, ack: true }).catch(() => {});
+      await this.setStateAsync('info.lastError',  { val: String(e && e.message || e), ack: true }).catch(() => {});
+    }
+  }
+
+  /**
+   * Prueft ob die fuer den Adapter kritischen Files existieren. Wenn nicht
+   * (z.B. nach npm-prune oder defektem Update), Watchdog triggern und Fehler
+   * loggen. Return true = OK, false = Fail.
+   */
+  _selfCheck() {
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      // Nur eigene Source-Files pruefen. node_modules-Check ist eine schlechte Idee
+      // weil:
+      //  - require() weiter unten wuerde es eh werfen
+      //  - fehlende node_modules sind ein anderes Problem (apt-hook npm prune)
+      //    das durch Reinstall geheilt werden muss, nicht durch Watchdog-Loop
+      const required = [
+        'lib/tuyaCloud.js',
+        'lib/specMapper.js',
+        'lib/tuyaLocal.js',
+        'lib/lanDiscovery.js'
+      ];
+      const missing = [];
+      for (const r of required) {
+        const full = path.join(__dirname, r);
+        if (!fs.existsSync(full)) missing.push(r);
+      }
+
+      if (missing.length) {
+        this.log.error('======================================================');
+        this.log.error('SELF-CHECK FEHLGESCHLAGEN: ' + missing.length + ' kritische Source-Files fehlen.');
+        this.log.error('Manueller Eingriff noetig:');
+        this.log.error('  bash /opt/iobroker/.fid-smartlife-watchdog.sh');
+        this.log.error('  oder Neu-Installation: bash install-smartlife.sh /tmp/fid-sl.zip');
+        this.log.error('Fehlt:');
+        for (const m of missing) this.log.error('  - ' + m);
+        this.log.error('======================================================');
+        // WICHTIG: NICHT automatisch den Watchdog triggern. Das hat in v0.5.1
+        // einen Restart-Loop verursacht der die ioredis-Connection von
+        // js-controller umgebracht hat ("DB closed" bei allen Adaptern).
+        return false;
+      }
+      return true;
+    } catch (e) {
+      this.log.warn('Self-Check selbst fehlgeschlagen: ' + (e && e.message || e));
+      return true;
+    }
+  }
+
+  async onUnload(cb) {
+    try {
+      this.shuttingDown = true;
+      if (this.pollTimer) { this.clearInterval(this.pollTimer); this.pollTimer = null; }
+      if (this.rediscoverTimer) { this.clearInterval(this.rediscoverTimer); this.rediscoverTimer = null; }
+      if (this.lanListener) { try { this.lanListener.stop(); } catch (e) {} this.lanListener = null; }
+      // Alle ausstehenden Debounce-Timer clearen
+      for (const k of Object.keys(this.writeTimers)) {
+        try { clearTimeout(this.writeTimers[k]); } catch (e) {}
+      }
+      await this.setStateAsync('info.connection', { val: false, ack: true }).catch(() => {});
+      cb();
+    } catch (e) { cb(); }
+  }
+
+  // -------------- Discovery & State-Anlage --------------
+
+  async discoverAll() {
+    try {
+      const list = await this.cloud.listDevices();
+      this.log.info('Discovery: ' + list.length + ' Geraete von Tuya geliefert');
+
+      for (const raw of list) {
+        if (this.shuttingDown) return;
+        try { await this.buildDevice(raw); }
+        catch (e) { this.log.warn('Device-Setup ' + raw.id + ' fehlgeschlagen: ' + e.message); }
+      }
+
+      await this.setStateAsync('info.deviceCount',   { val: this.devices.size, ack: true });
+      await this.setStateAsync('info.lastDiscovery', { val: new Date().toISOString(), ack: true });
+
+      // Legacy-Cleanup: alte Code-Name-States + _local.* Channel-Objekte aus
+      // v0.3.x/v0.4.0 wegraeumen die durch den tuya-Style-Refactor obsolet sind
+      try {
+        const removed = await this._cleanupLegacyStates();
+        if (removed > 0) this.log.info('Legacy-Cleanup: ' + removed + ' obsolete States/Channels geloescht');
+      } catch (e) {
+        this.log.warn('Legacy-Cleanup: ' + (e && e.message || e));
+      }
+
+      // Initial-Poll fuer alle frisch geladenen Geraete
+      this.log.info('Initial-Status holen ...');
+      let n = 0;
+      for (const id of this.devices.keys()) {
+        if (this.shuttingDown) return;
+        try { await this.pollDevice(id); n++; }
+        catch (e) { /* schon geloggt in pollDevice */ }
+      }
+      this.log.info('Initial-Status: ' + n + '/' + this.devices.size + ' OK');
+
+    } catch (e) {
+      this.log.error('Discovery: ' + e.message);
+      await this.setStateAsync('info.lastError', { val: 'discovery: ' + e.message, ack: true }).catch(() => {});
+      throw e;
+    }
+  }
+
+  /**
+   * Loescht obsolete States aus alten Adapter-Versionen:
+   *  - <dev>._local.* (v0.3.x/v0.4.0 Channel - jetzt Top-Level)
+   *  - <dev>.<codeCanon> wo es ein <dev>.<dpsId> als Primary gibt
+   *    (z.B. <dev>.switch_1 wenn <dev>.1 jetzt der primary State ist)
+   * Aliase, _name, _noCloudStatusPoll, localXxx, ip, noLocalConnection,
+   * online und die DPS-ID-States bleiben.
+   */
+  async _cleanupLegacyStates() {
+    const all = await this.getAdapterObjectsAsync().catch(() => null);
+    if (!all) return 0;
+
+    let removed = 0;
+    const KEEP_TOP = new Set([
+      '_name', '_noCloudStatusPoll',
+      'ip', 'noLocalConnection', 'online',
+      'localKey', 'localVersion', 'localPort', 'localSource', 'localLastResult', 'localLastSeen'
+    ]);
+
+    for (const [did, dev] of this.devices) {
+      const prefix = this.namespace + '.' + did + '.';
+      // Welche Pfade sollen erhalten bleiben?
+      const keepSet = new Set();
+      // - Alle DPS-ID-Pfade
+      for (const c of dev.defCanonSet) {
+        const meta = dev.dpMeta[c];
+        const primary = (meta && meta.dpId && String(meta.dpId) !== c) ? String(meta.dpId) : c;
+        keepSet.add(primary);
+      }
+      // - Alle Aliase
+      for (const a of Object.keys(dev.alias || {})) {
+        if (!a.startsWith('_')) keepSet.add(a);
+      }
+      // - Top-Level-Always
+      for (const k of KEEP_TOP) keepSet.add(k);
+
+      for (const fullId of Object.keys(all)) {
+        if (!fullId.startsWith(prefix)) continue;
+        const sub = fullId.slice(prefix.length);
+        if (!sub) continue;
+        const top = sub.split('.')[0];
+        // Alles unter _local.* wegloeschen (Channel + States)
+        if (top === '_local') {
+          try { await this.delObjectAsync(fullId); removed++; } catch (e) {}
+          continue;
+        }
+        // Nur Top-Level betrachten - geschachtelte States gibt's bei uns sonst keine
+        if (sub !== top) continue;
+        if (keepSet.has(top)) continue;
+        // Sonst: obsolet
+        try { await this.delObjectAsync(fullId); removed++; }
+        catch (e) {}
+      }
+    }
+    return removed;
+  }
+
+  async buildDevice(raw) {
+    const id   = raw.id;
+    const name = raw.name || id;
+    if (!id) return;
+
+    // Device-Objekt anlegen
+    await this.setObjectNotExistsAsync(id, {
+      type: 'device',
+      common: { name: name },
+      native: {}
+    });
+    await this.extendObjectAsync(id, { common: { name: name } });
+
+    // Spec laden
+    const spec = await this.cloud.getSpecification(id);
+    const defs = sm.specToDefs(spec);
+    const defCanonSet = new Set();
+    const dpMeta = Object.create(null);
+    const canonToReal = Object.create(null);
+    const dpIdToCanon = Object.create(null);  // '20' -> 'cur_voltage' fuer write-redirect
+
+    for (const d of defs) {
+      const c = sm.canon(d.codeReal || d.code || d.id);
+      if (!c) continue;
+      defCanonSet.add(c);
+      canonToReal[c] = String(d.codeReal || d.code || d.id);
+      dpMeta[c] = sm.extractMeta(d);
+      if (dpMeta[c].dpId && String(dpMeta[c].dpId) !== c) {
+        dpIdToCanon[String(dpMeta[c].dpId)] = c;
+      }
+    }
+
+    const alias = sm.computeAliases(defCanonSet, dpMeta);
+
+    // Meta-States anlegen
+    await this.ensureState(id + '._name', {
+      name: 'Name', type: 'string', role: 'text', read: true, write: false
+    });
+    await this.ensureState(id + '.online', {
+      name: name + ' - Cloud Online', type: 'boolean',
+      role: 'indicator.reachable', read: true, write: false
+    });
+    await this.ensureState(id + '._noCloudStatusPoll', {
+      name: 'Disable regular cloud status polling',
+      type: 'boolean', role: 'switch', read: true, write: true
+    });
+
+    await this.setStateAsync(id + '._name', { val: name, ack: true });
+    if (typeof raw.online !== 'undefined') {
+      await this.setStateAsync(id + '.online', { val: !!raw.online, ack: true });
+    }
+
+    // Default-Wert fuer _noCloudStatusPoll setzen falls in der noPoll-Liste
+    if (this.noPollSet.has(id)) {
+      const cur = await this.getStateAsync(id + '._noCloudStatusPoll');
+      if (!cur || cur.val !== true) {
+        await this.setStateAsync(id + '._noCloudStatusPoll', { val: true, ack: true });
+      }
+    }
+
+    // DP-States anlegen
+    for (const c of defCanonSet) {
+      await this.ensureCodeState(id, name, c, dpMeta[c]);
+    }
+
+    // Alias-States anlegen
+    for (const aliasKey of Object.keys(alias)) {
+      if (aliasKey.startsWith('_')) continue;  // _modeType etc sind Meta
+      await this.ensureAliasState(id, name, aliasKey, alias);
+    }
+
+    // Local-Channel + States anlegen
+    await this.ensureLocalStates(id, name, raw);
+
+    // Aktuelle Local-Werte aus States/raw lesen
+    const local = await this.readLocalStates(id, raw);
+
+    // Falls LAN-Discovery vor Cloud-Setup einen Eintrag geliefert hat -> IP+Version uebernehmen
+    const cached = this.discoveryCache[id];
+    if (cached) {
+      if (cached.ip && local.ip !== cached.ip) {
+        local.ip = cached.ip;
+        await this.setStateAsync(id + '.ip', { val: cached.ip, ack: true });
+      }
+      if (cached.version && local.version !== cached.version) {
+        local.version = cached.version;
+        await this.setStateAsync(id + '.localVersion', { val: cached.version, ack: true });
+      }
+      await this.setStateAsync(id + '.localLastSeen', { val: new Date(cached.ts).toISOString(), ack: true });
+      await this.setStateAsync(id + '.localSource',   { val: cached.source, ack: true });
+    }
+
+    // In Registry speichern
+    const cur = await this.getStateAsync(id + '._noCloudStatusPoll');
+    this.devices.set(id, {
+      id: id,
+      name: name,
+      raw: raw,
+      defs: defs,
+      defCanonSet: defCanonSet,
+      dpMeta: dpMeta,
+      canonToReal: canonToReal,
+      dpIdToCanon: dpIdToCanon,
+      alias: alias,
+      noCloudStatusPoll: !!(cur && cur.val),
+      local: local
+    });
+  }
+
+  // -------------- Local-Channel + States --------------
+
+  /**
+   * Tuya-Style: keine _local.* Channel-States mehr. Die LAN-Settings (key,
+   * version, port, source, preferLocal) leben jetzt direkt unter dem Device:
+   *   <dev>.ip                  IP-Adresse
+   *   <dev>.noLocalConnection   Top-Level (= !preferLocal), writable
+   *   <dev>.localKey            (writable, password-like)
+   *   <dev>.localVersion        (writable, default '3.3')
+   *   <dev>.localPort           (writable, default 6668)
+   *   <dev>.localSource         (read-only, woher die IP kommt)
+   *   <dev>.localLastResult     (read-only)
+   *   <dev>.localLastSeen       (read-only)
+   * 'online' wird woanders schon angelegt.
+   */
+  async ensureLocalStates(deviceId, deviceName, raw) {
+    const def = (id, common, value) => this.setObjectNotExistsAsync(deviceId + '.' + id, {
+      type: 'state',
+      common: Object.assign({ name: id, read: true, write: false }, common),
+      native: {}
+    }).then(() => {
+      if (typeof value !== 'undefined') return this.setStateAsync(deviceId + '.' + id, { val: value, ack: true });
+    });
+
+    await def('ip',                 { type: 'string',  role: 'info.ip',          write: true });
+    await def('noLocalConnection',  { type: 'boolean', role: 'switch.enable',    write: true }, true);
+    await def('localKey',           { type: 'string',  role: 'text',             write: true }, String(raw.local_key || ''));
+    await def('localVersion',       { type: 'string',  role: 'text',             write: true }, '3.3');
+    await def('localPort',          { type: 'number',  role: 'value',            write: true }, tuyaLocal.DEFAULT_PORT);
+    await def('localSource',        { type: 'string',  role: 'text' });
+    await def('localLastResult',    { type: 'string',  role: 'text' });
+    await def('localLastSeen',      { type: 'string',  role: 'text' });
+  }
+
+  async readLocalStates(deviceId, raw) {
+    const v = async (k, fallback) => {
+      const s = await this.getStateAsync(deviceId + '.' + k).catch(() => null);
+      return (s && s.val !== undefined && s.val !== null && s.val !== '') ? s.val : fallback;
+    };
+    const ip                = String(await v('ip', ''));
+    const key               = String(await v('localKey', raw && raw.local_key || ''));
+    const version           = String(await v('localVersion', '3.3'));
+    const port              = Number(await v('localPort', tuyaLocal.DEFAULT_PORT));
+    // tuya-Konvention: noLocalConnection = "Local NICHT verwenden". Wir
+    // intern: preferLocal = "Local bevorzugen". Also umkehren.
+    const noLocal           = !!(await v('noLocalConnection', true));
+    const preferLocal       = !noLocal;
+    const source            = String(await v('localSource', ''));
+
+    return { ip, key, version, port, preferLocal, source };
+  }
+
+  async ensureState(id, common) {
+    const c = Object.assign({
+      type: 'mixed', role: 'state', read: true, write: false
+    }, common);
+    await this.setObjectNotExistsAsync(id, { type: 'state', common: c, native: {} });
+  }
+
+  async ensureCodeState(deviceId, deviceName, codeCanon, meta) {
+    if (!codeCanon) return;
+    meta = meta || { type: 'string', writable: false };
+
+    // Min/Max mit Scale rueckrechnen
+    let min = meta.min, max = meta.max;
+    if (meta.type === 'number' && typeof meta.scale === 'number' && meta.scale > 0) {
+      const factor = Math.pow(10, meta.scale);
+      if (typeof min === 'number') min /= factor;
+      if (typeof max === 'number') max /= factor;
+    }
+
+    // Primary-State-Pfad bestimmen: DPS-ID wenn vorhanden, sonst Code-Name als
+    // Fallback (z.B. fuer extended-Codes wie 'mode' wo Tuya keine numerische
+    // DPS-ID rausgibt). Tuya-Convention: <device>.<dpsId> mit common.name = code-name.
+    const usesDpsId = !!(meta.dpId && String(meta.dpId) !== codeCanon);
+    const primaryPath = usesDpsId ? String(meta.dpId) : codeCanon;
+    const displayName = meta.friendly || codeCanon;
+
+    const common = {
+      // tuya-Style: name ist Code-Name, role/type wie spezifiziert
+      name: displayName,
+      type: meta.type,
+      role: sm.roleFor(codeCanon, meta.type),
+      read: true,
+      write: !!meta.writable
+    };
+    if (typeof meta.unit !== 'undefined') common.unit = meta.unit;
+    if (meta.writable) {
+      if (typeof min === 'number') common.min = min;
+      if (typeof max === 'number') common.max = max;
+    }
+    if (Array.isArray(meta.enums) && meta.enums.length) {
+      const st = {};
+      for (const e of meta.enums) st[e] = e;
+      common.states = st;
+    }
+
+    await this.setObjectNotExistsAsync(deviceId + '.' + primaryPath, {
+      type: 'state', common: common, native: { code: codeCanon, dpId: meta.dpId || null }
+    });
+  }
+
+  async ensureAliasState(deviceId, deviceName, aliasKey, aliasMeta) {
+    // Spezielle Eintraege in alias-Objekt, keine echten States
+    if (aliasKey.startsWith('_')) return;
+
+    const ALIAS_COMMONS = {
+      on:           { type: 'boolean', role: 'switch', read: true, write: true },
+      brightness:   { type: 'number',  role: 'level.dimmer', min: 0, max: 100, read: true, write: true },
+      color_temp_k: { type: 'number',  role: 'level.color.temperature', read: true, write: true },
+      color_rgb:    { type: 'string',  role: 'level.color.rgb', read: true, write: true },
+      mode:         { type: 'string',  role: 'state', read: true, write: true },
+      temperature:  { type: 'number',  role: 'value.temperature', read: true, write: false },
+      humidity:     { type: 'number',  role: 'value.humidity', read: true, write: false },
+      battery:      { type: 'number',  role: 'value.battery', read: true, write: false }
+    };
+    const c = Object.assign({}, ALIAS_COMMONS[aliasKey]);
+    if (!c.type) return;
+
+    // mode kann sowohl string (work_mode='colour') als auch number (mode=0/1/2) sein
+    if (aliasKey === 'mode' && aliasMeta && aliasMeta._modeType === 'number') {
+      c.type = 'number';
+    }
+
+    await this.setObjectNotExistsAsync(deviceId + '.' + aliasKey, {
+      type: 'state',
+      common: Object.assign({ name: deviceName + ' - ' + aliasKey }, c),
+      native: {}
+    });
+  }
+
+  // -------------- Polling --------------
+
+  async pollAll() {
+    if (this.shuttingDown) return;
+    const cfg = this.config || {};
+    const parallel = Math.max(1, Math.min(5, Number(cfg.maxParallelPolls) || 1));
+    const ids = Array.from(this.devices.keys());
+    let i = 0;
+    const workers = Array.from({ length: parallel }, () => (async () => {
+      while (i < ids.length && !this.shuttingDown) {
+        const idx = i++;
+        const id = ids[idx];
+        try { await this.pollDevice(id); }
+        catch (e) { /* schon geloggt in pollDevice */ }
+      }
+    })());
+    await Promise.all(workers);
+  }
+
+  async pollDevice(id) {
+    const dev = this.devices.get(id);
+    if (!dev) return;
+    // Aktuellen _noCloudStatusPoll-Wert respektieren (User kann live umschalten)
+    const noPollState = await this.getStateAsync(id + '._noCloudStatusPoll').catch(() => null);
+    if (noPollState && noPollState.val === true) {
+      this.log.debug('Skip cloud status poll for ' + dev.name + ' (' + id + ')');
+      return;
+    }
+    try {
+      const status = await this.cloud.getStatus(id);
+      await this.mirrorStatus(dev, status);
+      if (typeof dev.raw.online !== 'undefined') {
+        await this.setStateAsync(id + '.online', { val: !!dev.raw.online, ack: true });
+      }
+    } catch (e) {
+      const msg = String(e && e.message || e).toLowerCase();
+      if (msg.includes('function not support')) {
+        // Auto-disable polling fuer dieses Geraet
+        dev.noCloudStatusPoll = true;
+        await this.setStateAsync(id + '._noCloudStatusPoll', { val: true, ack: true }).catch(() => {});
+        this.log.warn('Cloud status poll deaktiviert fuer ' + dev.name + ' (' + id + '): function not support');
+        return;
+      }
+      this.log.warn('Poll fehlgeschlagen ' + dev.name + ' (' + id + '): ' + e.message);
+    }
+  }
+
+  async mirrorStatus(dev, statusArr) {
+    // Map: canonCode -> aktueller Wert (gescaled, fuer Status-Pass)
+    const valuesByCode = Object.create(null);
+
+    for (const s of statusArr || []) {
+      const realCode = String(s.code);
+      const c = sm.canon(realCode);
+
+      // Falls in der Spec nicht vorhanden, on-the-fly anlegen
+      if (!dev.canonToReal[c]) {
+        dev.canonToReal[c] = realCode;
+        dev.defCanonSet.add(c);
+      }
+      if (!dev.dpMeta[c]) {
+        // Tuya Status liefert manchmal eine dps-Eigenschaft. Falls nicht, faellt
+        // der Status auf reinem Code-State zurueck ohne Mirror.
+        dev.dpMeta[c] = {
+          type: typeof s.value === 'boolean' ? 'boolean'
+              : typeof s.value === 'number'  ? 'number'  : 'string',
+          writable: false,
+          friendly: realCode,
+          dpId: (typeof s.dps !== 'undefined') ? String(s.dps)
+              : (typeof s.dp !== 'undefined') ? String(s.dp) : undefined
+        };
+        if (dev.dpMeta[c].dpId && String(dev.dpMeta[c].dpId) !== c) {
+          if (!dev.dpIdToCanon) dev.dpIdToCanon = Object.create(null);
+          dev.dpIdToCanon[String(dev.dpMeta[c].dpId)] = c;
+        }
+        await this.ensureCodeState(dev.id, dev.name, c, dev.dpMeta[c]);
+      }
+
+      // Wert konvertieren - defensiver Typ-Coerce damit kein "type mismatch" Error
+      let v = s.value;
+      const meta = dev.dpMeta[c];
+      if (meta.type === 'number') {
+        if (typeof v === 'number') {
+          v = sm.scaleOut(meta, v);
+        } else if (typeof v === 'string') {
+          const n = Number(v);
+          if (!isNaN(n) && v.trim() !== '') v = sm.scaleOut(meta, n);
+          else {
+            // Nicht-numerischer String fuer number-State - skip statt crashen
+            this.log.debug('Status ' + dev.id + '.' + c + ': string "' + v + '" nicht als number parsebar, ueberspringe');
+            continue;
+          }
+        } else if (typeof v === 'boolean') {
+          v = v ? 1 : 0;
+        } else {
+          continue;  // null/undefined/object fuer number-State -> skip
+        }
+      } else if (meta.type === 'boolean') {
+        if (typeof v === 'string') v = ['true', '1', 'on'].includes(v.toLowerCase());
+        else if (typeof v === 'number') v = v !== 0;
+        else v = !!v;
+      } else if (meta.type === 'string') {
+        if (v === null || typeof v === 'undefined') v = '';
+        else if (typeof v !== 'string') v = JSON.stringify(v);
+      }
+
+      valuesByCode[c] = v;
+      // tuya-Style: nur in den primary State schreiben. Wenn DPS-ID vorhanden,
+      // ist das <dev>.<dpsId>. Sonst Fallback auf <dev>.<codeCanon>.
+      const meta2 = dev.dpMeta[c];
+      const primary = (meta2 && meta2.dpId && String(meta2.dpId) !== c) ? String(meta2.dpId) : c;
+      await this.setStateAsync(dev.id + '.' + primary, { val: v, ack: true });
+    }
+
+    // Aliase mit aktuellen Werten fuettern - sonst bleiben sie leer und sehen
+    // "doppelt aber ohne Wert" aus.
+    for (const aliasKey of Object.keys(dev.alias)) {
+      if (aliasKey.startsWith('_')) continue;  // _modeType etc sind Meta
+      const targetCode = dev.alias[aliasKey];
+      if (!(targetCode in valuesByCode)) continue;
+      let aliasVal = valuesByCode[targetCode];
+
+      // brightness: Geraete-Skala -> 0-100
+      if (aliasKey === 'brightness' && typeof aliasVal === 'number') {
+        const meta = dev.dpMeta[targetCode];
+        if (meta && typeof meta.max === 'number' && meta.max > 100) {
+          const min = typeof meta.min === 'number' ? meta.min : 0;
+          const max = meta.max;
+          if (max !== min) {
+            aliasVal = Math.round(((aliasVal - min) / (max - min)) * 100);
+          }
+        }
+      }
+
+      await this.setStateAsync(dev.id + '.' + aliasKey, { val: aliasVal, ack: true });
+    }
+  }
+
+  // -------------- Write-Handling --------------
+
+  async onStateChange(id, state) {
+    if (!state || state.ack) return;     // nur User-Writes mit ack=false
+    if (this.ignoreNextChange.has(id)) {
+      this.ignoreNextChange.delete(id);
+      return;
+    }
+
+    // Commands-Buttons
+    if (id === this.namespace + '.commands.rediscover') {
+      await this.setStateAsync(id, { val: false, ack: true });
+      this.log.info('Manuelle Rediscovery angefordert');
+      this.discoverAll().catch(e => this.log.warn('Rediscover: ' + e.message));
+      return;
+    }
+    if (id === this.namespace + '.commands.refreshAll') {
+      await this.setStateAsync(id, { val: false, ack: true });
+      this.log.info('Manueller refreshAll angefordert');
+      this.pollAll().catch(e => this.log.warn('refreshAll: ' + e.message));
+      return;
+    }
+    if (id === this.namespace + '.commands.rescanLan') {
+      await this.setStateAsync(id, { val: false, ack: true });
+      this.log.info('Rescan-LAN angefordert (re-import aus tuya.0 + Re-Apply Cache)');
+      (async () => {
+        try {
+          if (this.config.importLocalFromTuyaAdapter !== false) {
+            await this.importLocalFromTuyaAdapter();
+          }
+          // Cache-Records nochmal durch-applien
+          for (const did of Object.keys(this.discoveryCache)) {
+            await this.onLanDiscoveryRecord(this.discoveryCache[did]).catch(() => {});
+          }
+        } catch (e) { this.log.warn('rescanLan: ' + e.message); }
+      })();
+      return;
+    }
+
+    // Path zerlegen: fid-smartlife.0.<deviceId>.<code>
+    const prefix = this.namespace + '.';
+    if (!id.startsWith(prefix)) return;
+    const rest = id.slice(prefix.length);
+    const parts = rest.split('.');
+    if (parts.length < 2) return;
+    const deviceId = parts[0];
+    const code     = parts.slice(1).join('.');
+
+    if (code.startsWith('_')) return;            // interne Felder (z.B. _name, _noCloudStatusPoll)
+    const dev = this.devices.get(deviceId);
+    if (!dev) return;
+
+    // Lokale Settings (writable, kein Device-DP): nur ack-en, kein cloud/local-Write
+    const LOCAL_SETTINGS = new Set(['localKey','localVersion','localPort','localSource','localLastResult','localLastSeen','noLocalConnection','ip']);
+    if (LOCAL_SETTINGS.has(code)) {
+      await this.setStateAsync(id, { val: state.val, ack: true });
+      return;
+    }
+
+    // Alias?
+    if (sm.ALIAS_NAMES.has(code) && dev.alias[code]) {
+      await this.handleAliasWrite(dev, code, state.val);
+      return;
+    }
+
+    // DPS-ID-Write? (Primary-State - das ist der "richtige" Write-Pfad jetzt)
+    if (dev.dpIdToCanon && dev.dpIdToCanon[code]) {
+      const targetCanon = dev.dpIdToCanon[code];
+      await this.handleDirectWrite(dev, targetCanon, state.val);
+      return;
+    }
+
+    // Direkter Code-Name-Write? (Fallback fuer DPs ohne dpId - z.B. extended codes)
+    const c = sm.canon(code);
+    if (dev.canonToReal[c]) {
+      // Pruefen ob's keinen DPS-ID-State gibt der den Code beansprucht - sonst
+      // war's ein Write auf einen alten Code-State der durch Orphan-Cleanup
+      // gleich verschwindet
+      const meta = dev.dpMeta[c];
+      if (!meta || !meta.dpId || String(meta.dpId) === c) {
+        await this.handleDirectWrite(dev, c, state.val);
+      }
+      return;
+    }
+  }
+
+  async handleAliasWrite(dev, aliasKey, value) {
+    const targetCode = dev.alias[aliasKey];
+    if (!targetCode) return;
+
+    let writeVal = value;
+    // brightness: 0-100 -> Geraete-Skala
+    if (aliasKey === 'brightness' && typeof value === 'number') {
+      const meta = dev.dpMeta[targetCode];
+      if (meta && typeof meta.max === 'number' && meta.max > 100) {
+        const min = typeof meta.min === 'number' ? meta.min : 0;
+        const max = meta.max;
+        writeVal = Math.round(min + (value / 100) * (max - min));
+      }
+    }
+
+    try {
+      if (this.config.optimisticAck) {
+        // Alias + Ziel-State optimistisch setzen
+        await this.setStateAsync(dev.id + '.' + aliasKey, { val: value, ack: true });
+        // tuya-Style: primary state ist die DPS-ID wenn vorhanden
+        const tMeta = dev.dpMeta[targetCode];
+        const tPrimary = (tMeta && tMeta.dpId && String(tMeta.dpId) !== targetCode) ? String(tMeta.dpId) : targetCode;
+        await this.setStateAsync(dev.id + '.' + tPrimary, { val: writeVal, ack: true });
+      }
+      const realCode = dev.canonToReal[targetCode] || targetCode;
+      await this.sendDeviceCommands(dev, [{ codeCanon: targetCode, realCode: realCode, value: writeVal }]);
+      // Re-poll mit kurzer Verzoegerung
+      this.setTimeout(() => this.pollDevice(dev.id).catch(() => {}), 1500);
+    } catch (e) {
+      this.log.warn('Alias-Write fehlgeschlagen ' + dev.name + '.' + aliasKey + ': ' + e.message);
+    }
+  }
+
+  async handleDirectWrite(dev, codeCanon, value) {
+    // Debounce pro <device>::<code>
+    const key = dev.id + '::' + codeCanon;
+    if (this.writeTimers[key]) clearTimeout(this.writeTimers[key]);
+
+    const debounceMs = Math.max(0, Number(this.config.writeDebounceMs) || 400);
+
+    this.writeTimers[key] = setTimeout(async () => {
+      delete this.writeTimers[key];
+      try {
+        const meta = dev.dpMeta[codeCanon];
+        let writeVal = value;
+        if (typeof value === 'number') writeVal = sm.scaleIn(meta, value);
+
+        if (this.config.optimisticAck) {
+          const primary = (meta && meta.dpId && String(meta.dpId) !== codeCanon) ? String(meta.dpId) : codeCanon;
+          await this.setStateAsync(dev.id + '.' + primary, { val: value, ack: true });
+        }
+        const realCode = dev.canonToReal[codeCanon] || codeCanon;
+        await this.sendDeviceCommands(dev, [{ codeCanon: codeCanon, realCode: realCode, value: writeVal }]);
+        // Re-poll mit kurzer Verzoegerung
+        this.setTimeout(() => this.pollDevice(dev.id).catch(() => {}), 1500);
+      } catch (e) {
+        this.log.warn('Direkt-Write fehlgeschlagen ' + dev.name + '.' + codeCanon + ': ' + e.message);
+      }
+    }, debounceMs);
+  }
+
+  /**
+   * Zentrale Schreiblogik: erst Local probieren (wenn preferLocal=true), bei
+   * Fehler Cloud-Fallback. Sonst direkt Cloud.
+   *
+   * @param {object} dev          Device aus this.devices
+   * @param {Array<{codeCanon:string, realCode:string, value:any}>} pairs
+   */
+  async sendDeviceCommands(dev, pairs) {
+    // Frische Local-Settings aus States lesen (User kann sie live aendern)
+    dev.local = await this.readLocalStates(dev.id, dev.raw);
+
+    if (dev.local.preferLocal) {
+      // dpsMap: dpId-String -> value
+      const dpsMap = {};
+      let allDpsKnown = true;
+      for (const p of pairs) {
+        const meta = dev.dpMeta[p.codeCanon];
+        if (!meta || !meta.dpId) { allDpsKnown = false; break; }
+        dpsMap[meta.dpId] = p.value;
+      }
+
+      if (!allDpsKnown) {
+        await this.setStateAsync(dev.id + '.localLastResult', { val: 'local skipped: no dpId mapping', ack: true });
+        // Fallthrough auf Cloud
+      } else {
+        const r = await tuyaLocal.sendCommand({
+          ip:        dev.local.ip,
+          localKey:  dev.local.key,
+          deviceId:  dev.id,
+          dpsMap:    dpsMap,
+          version:   dev.local.version,
+          port:      dev.local.port,
+          timeoutMs: Number(this.config.localTimeoutMs) || 2500
+        });
+        await this.setStateAsync(dev.id + '.localLastResult', { val: 'local ' + r.reason, ack: true });
+        if (r.ok) return;   // Erfolg - kein Cloud-Versuch
+        this.log.debug('Local failed for ' + dev.name + ': ' + r.reason + ' - falling back to cloud');
+      }
+    }
+
+    // Cloud-Pfad
+    const cloudCmds = pairs.map(p => ({ code: p.realCode, value: p.value }));
+    await this.cloud.sendCommands(dev.id, cloudCmds);
+    if (dev.local.preferLocal) {
+      await this.setStateAsync(dev.id + '.localLastResult', { val: 'cloud fallback used', ack: true });
+    }
+  }
+
+  // -------------- LAN-Discovery --------------
+
+  async onLanDiscoveryRecord(rec) {
+    // Cache aktualisieren - falls Geraet noch nicht in Cloud-Discovery angekommen ist
+    this.discoveryCache[rec.id] = rec;
+
+    const dev = this.devices.get(rec.id);
+    if (!dev) return;  // Discovery vor Cloud-Setup, kommt spaeter durch buildDevice
+
+    let changed = false;
+    if (rec.ip && dev.local && dev.local.ip !== rec.ip) {
+      dev.local.ip = rec.ip;
+      await this.setStateAsync(dev.id + '.ip', { val: rec.ip, ack: true });
+      changed = true;
+    }
+    if (rec.version && dev.local && dev.local.version !== rec.version) {
+      dev.local.version = rec.version;
+      await this.setStateAsync(dev.id + '.localVersion', { val: rec.version, ack: true });
+      changed = true;
+    }
+    await this.setStateAsync(dev.id + '.localLastSeen', { val: new Date(rec.ts).toISOString(), ack: true });
+    await this.setStateAsync(dev.id + '.localSource',   { val: rec.source, ack: true });
+    if (changed) {
+      this.log.info('LAN-Discovery: ' + dev.name + ' -> ' + rec.ip + (rec.version ? ' v' + rec.version : ''));
+    }
+  }
+
+  // -------------- Import lokaler IPs aus iobroker.tuya --------------
+
+  async importLocalFromTuyaAdapter() {
+    let n = 0;
+    for (const [id, dev] of this.devices) {
+      try {
+        const ok = await this.importLocalFromTuyaAdapterOne(id, dev);
+        if (ok) n++;
+      } catch (e) { /* still */ }
+    }
+    if (n > 0) this.log.info('Local IPs aus tuya.0 importiert: ' + n + ' Geraete');
+  }
+
+  async importLocalFromTuyaAdapterOne(id, dev) {
+    const base = 'tuya.0.' + id;
+    // Object existence check
+    const obj = await this.getForeignObjectAsync(base).catch(() => null);
+    if (!obj) return false;
+
+    // IP candidates
+    let ip = '';
+    for (const sub of ['ip', 'local_ip', 'device_ip']) {
+      const s = await this.getForeignStateAsync(base + '.' + sub).catch(() => null);
+      const v = s && s.val ? String(s.val).trim() : '';
+      if (v && tuyaLocal.isPrivateIp(v)) { ip = v; break; }
+    }
+    // Native fallback
+    if (!ip && obj.native) {
+      const v = String(obj.native.ip || obj.native.localIp || '').trim();
+      if (tuyaLocal.isPrivateIp(v)) ip = v;
+    }
+    if (!ip) return false;
+
+    // Version (selten in States, oft in native)
+    let version = '';
+    for (const sub of ['version', 'protocol', 'ver']) {
+      const s = await this.getForeignStateAsync(base + '.' + sub).catch(() => null);
+      const v = s && s.val ? String(s.val).trim() : '';
+      if (v) { version = v; break; }
+    }
+    if (!version && obj.native) version = String(obj.native.version || obj.native.ver || '').trim();
+
+    // In Local-States schreiben (nicht ueberschreiben wenn schon was anderes drin)
+    const ipState = await this.getStateAsync(id + '.ip').catch(() => null);
+    if (!ipState || !ipState.val) {
+      await this.setStateAsync(id + '.ip', { val: ip, ack: true });
+      if (dev && dev.local) dev.local.ip = ip;
+    }
+    if (version) {
+      const verState = await this.getStateAsync(id + '.localVersion').catch(() => null);
+      if (!verState || !verState.val) {
+        await this.setStateAsync(id + '.localVersion', { val: version, ack: true });
+        if (dev && dev.local) dev.local.version = version;
+      }
+    }
+    await this.setStateAsync(id + '.localSource', { val: 'tuya.0', ack: true });
+    return true;
+  }
+}
+
+if (require.main !== module) {
+  module.exports = (options) => new FiducerionSmartlife(options);
+} else {
+  new FiducerionSmartlife();
+}

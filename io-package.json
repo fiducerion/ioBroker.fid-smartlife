@@ -1,0 +1,232 @@
+{
+  "common": {
+    "name": "fid-smartlife",
+    "version": "0.5.3",
+    "news": {
+      "0.5.3": {
+        "en": "Hotfix Watchdog Loop. v0.5.1/v0.5.2 had a self-check that auto-triggered the watchdog. The watchdog then ran 'npm install --production' which during running ioBroker killed the ioredis connection of js-controller - in the log: 'DB closed' for smartlife AND sonoff AND others. js-controller immediately restarted the adapter, self-check failed again, watchdog triggered, npm install ... classic loop, every 2-5min. Fix: (1) Self-check no longer auto-triggers the watchdog - adapter terminates with clear manual instructions. (2) Watchdog does NO npm install and NO auto-restart anymore. It only restores files and creates a cooldown file to prevent re-running more than 1x per hour. (3) Cron frequency from 10min to 1h. (4) If node_modules is destroyed, that's a job for 'bash install-smartlife.sh' - manual, once, clean.",
+        "de": "Hotfix Watchdog-Loop. v0.5.1/v0.5.2 hatten einen Self-Check der den Watchdog automatisch ausgeloest hat. Der Watchdog hat dann ein 'npm install --production' ausgefuehrt, was bei laufendem ioBroker die ioredis-Connection von js-controller umgebracht hat - im Log: 'DB closed' bei smartlife UND sonoff UND anderen. js-controller hat den Adapter dann sofort wieder neu gestartet, Self-Check failed again, Watchdog ausgeloest, npm install ... klassischer Loop, alle 2-5min. Fix: (1) Self-Check triggert den Watchdog NICHT mehr automatisch - der Adapter terminiert sich nur noch mit klarer Anleitung. (2) Watchdog macht KEIN npm install mehr und KEIN auto-restart. Er restauriert nur Files und legt eine Cooldown-Datei an damit er nicht oefter als 1x pro Stunde laeuft. (3) Cron-Frequenz von 10min auf 1h gesenkt. (4) Wenn node_modules zerstoert ist, ist das ein Job fuer 'bash install-smartlife.sh' - manuell, einmalig, sauber."
+      },
+      "0.5.2": {
+        "en": "Hotfix: self-check in 0.5.1 was looking for lib/cloud.js but the actual file is lib/tuyaCloud.js - so the adapter terminated itself on every start with 'SELF-CHECK FEHLGESCHLAGEN: 1 kritische Files/Module fehlen'. Self-check file list and watchdog sentinel both corrected.",
+        "de": "Hotfix: der Self-Check in 0.5.1 hat nach lib/cloud.js gesucht, die Datei heisst aber lib/tuyaCloud.js - daher hat der Adapter sich bei jedem Start selbst terminiert mit 'SELF-CHECK FEHLGESCHLAGEN: 1 kritische Files/Module fehlen'. Self-Check-Dateiliste und Watchdog-Sentinel beide korrigiert."
+      },
+      "0.5.1": {
+        "en": "Reboot-resistance hardened (same fixes as fid-bridge 0.12.3). After an OS update apt-hooks ran npm-prune on /opt/iobroker which broke all three Fiducerion adapters. (1) Self-Check in onReady() - terminates immediately with clear error log if critical files missing, instead of slow death by ENOENT errors. (2) Installer creates real npm-compatible tarball at /opt/iobroker/.fid-smartlife-tarball.tgz via npm pack, sets installedFrom=file:<tarball>. (3) Cron watchdog at /opt/iobroker/.fid-smartlife-watchdog.sh runs every 10 minutes, restores files from tarball if missing, runs npm install --production if node_modules incomplete, restarts adapter. Auto-recovery without user intervention. Watchdog logs to /opt/iobroker/log/fid-smartlife-watchdog.log.",
+        "de": "Reboot-Resistenz gehaertet (gleiche Fixes wie fid-bridge 0.12.3). Nach einem OS-Update haben apt-Hooks npm-prune auf /opt/iobroker laufen lassen, was alle drei Fiducerion-Adapter kaputt gemacht hat. (1) Self-Check in onReady() - terminiert sofort mit klarem Error-Log wenn kritische Files fehlen, statt langsamem ENOENT-Tod. (2) Installer erzeugt echtes npm-kompatibles Tarball unter /opt/iobroker/.fid-smartlife-tarball.tgz via npm pack, setzt installedFrom=file:<tarball>. (3) Cron-Watchdog unter /opt/iobroker/.fid-smartlife-watchdog.sh laeuft alle 10 Minuten, restauriert Files aus Tarball falls fehlend, fuehrt npm install --production aus wenn node_modules unvollstaendig, startet Adapter neu. Auto-Recovery ohne User-Eingriff. Watchdog-Logs nach /opt/iobroker/log/fid-smartlife-watchdog.log."
+      },
+      "0.5.0": {
+        "en": "Major state layout refactor to match iobroker.tuya 1:1. (1) NO MORE double states. Each datapoint exists ONCE under its DPS-ID (e.g. <dev>.1 for switch_1, <dev>.20 for cur_voltage). The common.name carries the code-name for readability. The v0.4.0 code-name + DPS-ID double-mirror is gone. (2) Local settings moved from <dev>._local.* to top-level: <dev>.ip, <dev>.noLocalConnection (writable, '!preferLocal'), <dev>.localKey, <dev>.localVersion, <dev>.localPort, <dev>.localSource, <dev>.localLastResult, <dev>.localLastSeen. The _local channel is removed entirely. (3) Aliases (on, brightness, temperature, etc.) stay - they're convenience wrappers, not duplicates. (4) Legacy-Cleanup runs on first start of v0.5.0: deletes all <dev>._local.* objects from v0.3.x/v0.4.0, plus any code-name states (switch_1, cur_voltage, ...) where the DPS-ID is now the primary. Logged as 'Legacy-Cleanup: N obsolete States/Channels geloescht'. Migration is automatic. After this update, your VIS bindings and scripts can simply rename 'tuya.0.<dev>.X' to 'fid-smartlife.0.<dev>.X' - the layout is now identical.",
+        "de": "Grosser State-Layout-Refactor um 1:1 mit iobroker.tuya kompatibel zu sein. (1) KEINE DOPPELTEN States mehr. Jeder Datenpunkt existiert EINMAL unter seiner DPS-ID (z.B. <dev>.1 fuer switch_1, <dev>.20 fuer cur_voltage). Der common.name traegt den Code-Namen zur Lesbarkeit. Das v0.4.0-Doppel-Mirror aus Code-Name+DPS-ID ist weg. (2) Lokale Settings vom <dev>._local.* Channel auf Top-Level umgezogen: <dev>.ip, <dev>.noLocalConnection (writable, '!preferLocal'), <dev>.localKey, <dev>.localVersion, <dev>.localPort, <dev>.localSource, <dev>.localLastResult, <dev>.localLastSeen. Der _local-Channel wird komplett geloescht. (3) Aliase (on, brightness, temperature, ...) bleiben - das sind Komfort-Wrapper, keine Duplikate. (4) Legacy-Cleanup laeuft beim ersten v0.5.0-Start: loescht alle <dev>._local.* Objekte aus v0.3.x/v0.4.0 plus alle Code-Namen-States (switch_1, cur_voltage, ...) wo die DPS-ID jetzt der primary ist. Geloggt als 'Legacy-Cleanup: N obsolete States/Channels geloescht'. Migration automatisch. Nach diesem Update koennen deine VIS-Bindings und Skripte einfach 'tuya.0.<dev>.X' auf 'fid-smartlife.0.<dev>.X' umbenennen - das Layout ist jetzt identisch."
+      },
+      "0.4.0": {
+        "en": "Compatibility with iobroker.tuya state layout. The original iobroker.tuya adapter exposes each datapoint not only under its code name (cur_voltage, child_lock, switch_1) but ALSO under the numeric DPS-ID (20, 41, 1). Existing scripts and VIS bindings often use the DPS-ID form. (1) New DPS-ID Mirror: for every datapoint with a known DPS-ID, an additional state is created under that numeric ID, kept in sync with the code state. Writes to the DPS-ID state are redirected to the code-state write path. (2) Top-Level mirrors for ip and noLocalConnection: <device>.ip mirrors <device>._local.ip, <device>.noLocalConnection mirrors !<device>._local.preferLocal. Existing 'tuya.0.<device>.ip' bindings now work as 'fid-smartlife.0.<device>.ip'. (3) On-the-fly state creation got smarter: when an unknown code arrives from cloud status and it has a dps-field, the DPS-ID-Mirror is also created. (4) DPS-ID-Mirror can be disabled via config option dpsMirror=false if you only want the code-name states.",
+        "de": "Kompatibilitaet zum iobroker.tuya State-Layout. Der originale iobroker.tuya-Adapter legt jeden Datenpunkt nicht nur unter dem Code-Namen an (cur_voltage, child_lock, switch_1) sondern AUCH unter der numerischen DPS-ID (20, 41, 1). Bestehende Skripte und VIS-Bindungen lesen oft die DPS-ID-Form. (1) Neuer DPS-ID-Mirror: fuer jeden Datenpunkt mit bekannter DPS-ID wird ein zusaetzlicher State unter dieser numerischen ID angelegt, der live synchron zum Code-State gehalten wird. Writes auf den DPS-ID-State werden zum Code-State-Schreibpfad umgeleitet. (2) Top-Level-Mirrors fuer ip und noLocalConnection: <device>.ip spiegelt <device>._local.ip, <device>.noLocalConnection spiegelt !<device>._local.preferLocal. Bestehende 'tuya.0.<device>.ip'-Bindings funktionieren jetzt als 'fid-smartlife.0.<device>.ip'. (3) On-the-fly State-Anlage wurde schlauer: wenn ein unbekannter Code aus dem Cloud-Status kommt und ein dps-Feld hat, wird auch der DPS-ID-Mirror angelegt. (4) DPS-ID-Mirror kann via Config-Option dpsMirror=false deaktiviert werden, wenn man nur die Code-Namen-States moechte. Plus neues Logo."
+      },
+      "0.3.0": {
+        "en": "Local protocol (Tuya v3.3) added. Per device under _local.* there are now: ip, key, version, port, preferLocal, lastResult, lastSeen, source. If preferLocal=true, write commands go via LAN (AES-128-ECB encrypted, real CRC32, port 6668) before falling back to cloud. localKey is auto-taken from cloud discovery. IPs are imported from tuya.0 on first start (if iobroker.tuya is still installed) and updated live via UDP broadcast listener on ports 6666/6667/7000. New command commands.rescanLan to re-import. Schemas from iobroker.tuya were deliberately NOT included - those are only useful when cloud spec is unavailable, and our 96 devices have full cloud spec.",
+        "de": "Lokales Protokoll (Tuya v3.3) hinzugefuegt. Pro Geraet unter _local.* gibt es jetzt: ip, key, version, port, preferLocal, lastResult, lastSeen, source. Wenn preferLocal=true, gehen Schreibbefehle ueber LAN (AES-128-ECB-verschluesselt, echter CRC32, Port 6668) bevor auf Cloud zurueckgegriffen wird. localKey wird automatisch aus Cloud-Discovery uebernommen. IPs werden beim ersten Start aus tuya.0 importiert (falls iobroker.tuya noch parallel laeuft) und live via UDP-Broadcast-Listener auf 6666/6667/7000 aktualisiert. Neuer Befehl commands.rescanLan fuer Re-Import. Die Schemas aus iobroker.tuya wurden bewusst NICHT uebernommen - die helfen nur wenn keine Cloud-Spec verfuegbar ist, und unsere 96 Geraete haben volle Cloud-Spec."
+      },
+      "0.2.2": {
+        "en": "Three fixes for spec/reality mismatches: (1) alias resolver now also checks the type of the matched DP, so 'relay_status' as number no longer gets picked as 'on' boolean alias (Bluetooth Gateway), and 'battery_state' as string no longer gets picked as 'battery' number alias (T&H sensors). (2) The 'mode' alias is created as number when the underlying DP is numeric, as string otherwise. (3) min/max constraints from the Tuya spec are no longer applied to read-only states - Tuya specs frequently lie (e.g. spec says min=35 for humidity setting but device actually reports 30) and iobroker would then refuse the state update entirely. Min/max stay on writable states as user-input protection. Plus defensive type coercion in status pump - non-parseable string values for number-states are now skipped with a debug log instead of crashing.",
+        "de": "Drei Fixes fuer Spec/Realitaets-Diskrepanzen: (1) Alias-Resolver prueft jetzt auch den Typ des Match-DPs, sodass 'relay_status' als number nicht mehr als 'on' boolean Alias gewaehlt wird (Bluetooth Gateway), und 'battery_state' als string nicht mehr als 'battery' number Alias (T&H Sensoren). (2) Der 'mode' Alias wird als number angelegt wenn der zugrundeliegende DP numerisch ist, sonst als string. (3) Min/max-Constraints aus der Tuya-Spec werden nicht mehr auf Read-Only States angewendet - Tuya-Specs luegen oft (z.B. spec sagt min=35 fuer humidity setting aber Geraet liefert real 30) und iobroker wuerde den State-Update dann komplett verweigern. Min/max bleibt bei writable States als User-Input-Schutz. Plus defensiver Typ-Coerce in der Status-Pumpe - nicht-parsebare String-Werte fuer Number-States werden jetzt mit Debug-Log uebersprungen statt zu crashen."
+      },
+      "0.2.1": {
+        "en": "Fix: admin.0 logged 'invalid jsonConfig' warnings every few seconds because clientId and clientSecret had a 'defaultValue' property which is not allowed in the jsonConfig schema for text/password types. Defaults live in io-package.json native already, so the field was redundant. Removed.",
+        "de": "Fix: admin.0 hat alle paar Sekunden 'invalid jsonConfig' Warnings ins Log geschrieben, weil clientId und clientSecret eine 'defaultValue'-Property hatten die im jsonConfig-Schema fuer text/password-Typen nicht erlaubt ist. Defaults stehen sowieso schon in io-package.json native, das Feld war redundant. Entfernt."
+      },
+      "0.2.0": {
+        "en": "Adapter renamed from iobroker.fiducerion-smartlife to iobroker.fid-smartlife. Shorter, easier to type. Migration: deinstall the old adapter, install this one fresh, reconfigure Access ID + Secret + Region. There is no automated migration because the old install is fresh (v0.1.x) and has no valuable settings. Also: the installer is now called install-smartlife.sh (instead of update.sh) so it can no longer be confused with the bridge installer.",
+        "de": "Adapter umbenannt von iobroker.fiducerion-smartlife auf iobroker.fid-smartlife. Kuerzer, einfacher zu tippen. Migration: alten Adapter deinstallieren, diesen neu installieren, Access ID + Secret + Region erneut eintragen. Keine automatische Migration weil die alte Installation frisch ist (v0.1.x) und keine wertvollen Settings enthaelt. Ausserdem: der Installer heisst jetzt install-smartlife.sh (statt update.sh) und kann nicht mehr mit dem Bridge-Installer verwechselt werden."
+      },
+      "0.1.1": {
+        "en": "New official adapter logo. Removed encryptedNative for clientSecret (caused saved Access Secret to come back encrypted from adapter.config and break cloud auth) - protectedNative still keeps it from being exposed via API. Aliases (.on / .brightness / .color_temp_k etc.) are now updated on every cloud poll, not only on write - 'brightness' state no longer stays empty, and the apparent 'switch_led doubled' was actually just the alias 'on' not getting filled from the read path. Brightness alias auto-rescales device-scale (0-1000 typical) down to 0-100 on read. Fallback decryption via getEncryptedConfig if a previously encrypted secret is still in the DB after the io-package update.",
+        "de": "Neues offizielles Adapter-Logo. encryptedNative fuer clientSecret entfernt (sorgte dafuer dass das gespeicherte Access Secret verschluesselt in adapter.config landete und die Cloud-Auth scheiterte) - protectedNative haelt es weiterhin aus der API raus. Aliase (.on / .brightness / .color_temp_k etc.) werden jetzt bei jedem Cloud-Poll aktualisiert, nicht nur beim Write - 'brightness' bleibt nicht mehr leer, und das vermeintliche 'switch_led doppelt' war eigentlich der Alias 'on' der vom Lesepfad nicht gefuettert wurde. Brightness-Alias rechnet die Geraete-Skala (typisch 0-1000) automatisch beim Lesen auf 0-100 zurueck. Fallback-Entschluesselung via getEncryptedConfig falls ein zuvor verschluesseltes Secret nach dem io-package-Update noch in der DB steht."
+      },
+      "0.1.0": {
+        "en": "Initial release. Cloud-first Tuya / Smartlife adapter, ported from the TuyaCloudReplace v2.5.2 user script. Discovers all devices via Tuya OpenAPI v2, mirrors states under fid-smartlife.0.<deviceId>.*, supports write commands, alias bindings (.on / .brightness / .color_temp_k / .color_rgb / .mode / .temperature / .humidity / .battery), per-device disable of cloud status polling for buggy devices, periodic rediscovery. Local protocol (Tuya LAN v3.3) is planned for v0.2.0.",
+        "de": "Erste Version. Cloud-First Tuya / Smartlife Adapter, portiert vom TuyaCloudReplace v2.5.2 User-Skript. Discovery aller Geraete ueber Tuya OpenAPI v2, States unter fid-smartlife.0.<deviceId>.*, Schreibbefehle, Alias-Bindings (.on / .brightness / .color_temp_k / .color_rgb / .mode / .temperature / .humidity / .battery), pro Geraet abschaltbares Cloud-Status-Polling fuer zickige Devices, periodische Rediscovery. Lokales Protokoll (Tuya LAN v3.3) ist fuer v0.2.0 geplant."
+      }
+    },
+    "title": "Fiducerion Smartlife",
+    "titleLang": {
+      "en": "Fiducerion Smartlife",
+      "de": "Fiducerion Smartlife"
+    },
+    "desc": {
+      "en": "Tuya / Smartlife cloud adapter - part of Fiducerion Core.",
+      "de": "Tuya / Smartlife Cloud-Adapter - Teil von Fiducerion Core."
+    },
+    "authors": [
+      "Bernd <noreply@example.com>"
+    ],
+    "keywords": [
+      "tuya",
+      "smartlife",
+      "fiducerion"
+    ],
+    "license": "MIT",
+    "platform": "Javascript/Node.js",
+    "main": "main.js",
+    "icon": "fid-smartlife.png",
+    "enabled": true,
+    "extIcon": "https://raw.githubusercontent.com/USER/iobroker.fid-smartlife/main/admin/fid-smartlife.png",
+    "readme": "https://github.com/USER/iobroker.fid-smartlife/blob/main/README.md",
+    "loglevel": "info",
+    "mode": "daemon",
+    "type": "iot-systems",
+    "compact": false,
+    "connectionType": "cloud",
+    "dataSource": "poll",
+    "adminUI": {
+      "config": "json"
+    },
+    "messagebox": false,
+    "supportCustoms": false,
+    "subscribable": false,
+    "subscribe": false,
+    "tier": 2,
+    "dependencies": [
+      {
+        "js-controller": ">=5.0.0"
+      }
+    ],
+    "globalDependencies": [],
+    "stopBeforeUpdate": true,
+    "restartAdapters": [],
+    "supportedMessages": {
+      "custom": false,
+      "deviceManager": false
+    }
+  },
+  "native": {
+    "clientId": "",
+    "clientSecret": "",
+    "region": "eu",
+    "pollIntervalSec": 60,
+    "rediscoverIntervalMin": 720,
+    "writeDebounceMs": 400,
+    "requestTimeoutMs": 12000,
+    "optimisticAck": true,
+    "maxParallelPolls": 1,
+    "noCloudStatusPollIds": "bf6458jx9qqkvqdc,80270017bcddc2379ee4",
+    "enableLanDiscovery": true,
+    "importLocalFromTuyaAdapter": true,
+    "localTimeoutMs": 2500,
+    "debug": false
+  },
+  "protectedNative": [
+    "clientSecret"
+  ],
+  "notifications": [],
+  "instanceObjects": [
+    {
+      "_id": "info",
+      "type": "channel",
+      "common": {
+        "name": "Status information"
+      },
+      "native": {}
+    },
+    {
+      "_id": "info.connection",
+      "type": "state",
+      "common": {
+        "role": "indicator.connected",
+        "name": "Cloud connected",
+        "type": "boolean",
+        "read": true,
+        "write": false,
+        "def": false
+      },
+      "native": {}
+    },
+    {
+      "_id": "info.deviceCount",
+      "type": "state",
+      "common": {
+        "role": "value",
+        "name": "Total devices",
+        "type": "number",
+        "read": true,
+        "write": false,
+        "def": 0
+      },
+      "native": {}
+    },
+    {
+      "_id": "info.lastDiscovery",
+      "type": "state",
+      "common": {
+        "role": "text",
+        "name": "Last discovery (ISO)",
+        "type": "string",
+        "read": true,
+        "write": false,
+        "def": ""
+      },
+      "native": {}
+    },
+    {
+      "_id": "info.lastError",
+      "type": "state",
+      "common": {
+        "role": "text",
+        "name": "Last error",
+        "type": "string",
+        "read": true,
+        "write": false,
+        "def": ""
+      },
+      "native": {}
+    },
+    {
+      "_id": "commands",
+      "type": "channel",
+      "common": {
+        "name": "Commands"
+      },
+      "native": {}
+    },
+    {
+      "_id": "commands.rediscover",
+      "type": "state",
+      "common": {
+        "role": "button",
+        "name": "Trigger rediscovery now",
+        "type": "boolean",
+        "read": true,
+        "write": true,
+        "def": false
+      },
+      "native": {}
+    },
+    {
+      "_id": "commands.refreshAll",
+      "type": "state",
+      "common": {
+        "role": "button",
+        "name": "Refresh state of all devices",
+        "type": "boolean",
+        "read": true,
+        "write": true,
+        "def": false
+      },
+      "native": {}
+    },
+    {
+      "_id": "commands.rescanLan",
+      "type": "state",
+      "common": {
+        "role": "button",
+        "name": "Rescan local IPs from tuya.0 + LAN-Discovery-Cache",
+        "type": "boolean",
+        "read": true,
+        "write": true,
+        "def": false
+      },
+      "native": {}
+    }
+  ],
+  "objects": []
+}

@@ -1,0 +1,176 @@
+{
+  "type": "panel",
+  "i18n": true,
+  "items": {
+    "_header_cloud": {
+      "newLine": true,
+      "type": "header",
+      "size": 3,
+      "text": "Tuya Cloud (IoT Platform)"
+    },
+    "_info_cloud": {
+      "newLine": true,
+      "type": "staticText",
+      "text": "Lege dir auf iot.tuya.com einen Cloud-Project an, linke deine SmartLife-App und kopiere Access ID / Access Secret hierher. Die Region muss zu deinem App-Account passen.",
+      "style": { "fontStyle": "italic", "marginBottom": "12px", "color": "#666" }
+    },
+    "clientId": {
+      "newLine": true,
+      "type": "text",
+      "label": "Access ID (Client ID)",
+      "help": "Dein Tuya Cloud Access ID",
+      "sm": 12, "md": 6
+    },
+    "clientSecret": {
+      "type": "password",
+      "label": "Access Secret (Client Secret)",
+      "help": "Dein Tuya Cloud Access Secret",
+      "sm": 12, "md": 6
+    },
+    "region": {
+      "newLine": true,
+      "type": "select",
+      "label": "Region",
+      "options": [
+        { "value": "eu", "label": "Europe (openapi.tuyaeu.com)" },
+        { "value": "us", "label": "America (openapi.tuyaus.com)" },
+        { "value": "cn", "label": "China (openapi.tuyacn.com)" },
+        { "value": "in", "label": "India (openapi.tuyain.com)" }
+      ],
+      "sm": 12, "md": 4
+    },
+    "_header_poll": {
+      "newLine": true,
+      "type": "header",
+      "size": 3,
+      "text": "Polling"
+    },
+    "pollIntervalSec": {
+      "newLine": true,
+      "type": "number",
+      "min": 10,
+      "max": 3600,
+      "label": "Poll-Intervall (Sekunden)",
+      "help": "Wie oft Geraetestatus aus der Cloud abgerufen wird. Default 60.",
+      "sm": 12, "md": 3
+    },
+    "rediscoverIntervalMin": {
+      "type": "number",
+      "min": 0,
+      "max": 10080,
+      "label": "Rediscovery (Minuten)",
+      "help": "0 = keine periodische Rediscovery. Default 720 (alle 12 Stunden).",
+      "sm": 12, "md": 3
+    },
+    "maxParallelPolls": {
+      "type": "number",
+      "min": 1,
+      "max": 5,
+      "label": "Parallele Polls",
+      "help": "Wie viele Geraete gleichzeitig gepollt werden. Default 1 (sequentiell, schonend).",
+      "sm": 12, "md": 3
+    },
+    "requestTimeoutMs": {
+      "type": "number",
+      "min": 2000,
+      "max": 60000,
+      "label": "Request-Timeout (ms)",
+      "help": "HTTP-Timeout fuer einzelne Cloud-Aufrufe. Default 12000.",
+      "sm": 12, "md": 3
+    },
+    "_header_write": {
+      "newLine": true,
+      "type": "header",
+      "size": 3,
+      "text": "Schreiben (Commands)"
+    },
+    "writeDebounceMs": {
+      "newLine": true,
+      "type": "number",
+      "min": 0,
+      "max": 5000,
+      "label": "Write-Debounce (ms)",
+      "help": "Zusammenfassen schnell aufeinanderfolgender Writes. Default 400.",
+      "sm": 12, "md": 4
+    },
+    "optimisticAck": {
+      "type": "checkbox",
+      "label": "Optimistic ACK",
+      "help": "Beim Schreiben den State sofort mit ack=true zurueckschreiben, bevor das Geraet bestaetigt. Schnelle UI-Reaktion. Default an.",
+      "sm": 12, "md": 4
+    },
+    "_header_quirks": {
+      "newLine": true,
+      "type": "header",
+      "size": 3,
+      "text": "Geraete-Eigenheiten"
+    },
+    "noCloudStatusPollIds": {
+      "newLine": true,
+      "type": "text",
+      "label": "Geraete-IDs ohne Cloud-Status-Poll",
+      "help": "Komma-getrennte Liste von deviceIds die NICHT regelmaessig per Cloud gepollt werden sollen (z.B. weil sie 'function not support' werfen). Default enthaelt zwei bekannte Problemgeraete.",
+      "sm": 12, "md": 12,
+      "noTranslation": true
+    },
+    "_header_local": {
+      "newLine": true,
+      "type": "header",
+      "size": 3,
+      "text": "Lokale Steuerung (LAN, Tuya v3.3)"
+    },
+    "_info_local": {
+      "newLine": true,
+      "type": "staticText",
+      "text": "Pro Geraet kann via fid-smartlife.0.<deviceId>._local.preferLocal=true aktiviert werden, dass Schreibbefehle ueber LAN statt Cloud gehen. localKey wird aus der Cloud-Discovery uebernommen. IP+Version koennen aus tuya.0 importiert werden, falls dieser Adapter noch parallel laeuft, oder per UDP-Broadcast erkannt werden.",
+      "style": { "fontStyle": "italic", "marginBottom": "12px", "color": "#666" }
+    },
+    "enableLanDiscovery": {
+      "newLine": true,
+      "type": "checkbox",
+      "label": "LAN-Discovery aktivieren (UDP 6666/6667/7000)",
+      "help": "Lauscht auf Tuya-Geraete-Broadcasts und uebernimmt IP+Version automatisch in die _local-States.",
+      "sm": 12, "md": 6
+    },
+    "importLocalFromTuyaAdapter": {
+      "type": "checkbox",
+      "label": "Import lokaler IPs aus tuya.0",
+      "help": "Falls iobroker.tuya parallel laeuft, werden lokale IPs/Versionen beim Start uebernommen.",
+      "sm": 12, "md": 6
+    },
+    "localTimeoutMs": {
+      "newLine": true,
+      "type": "number",
+      "min": 500,
+      "max": 30000,
+      "label": "Lokales Timeout (ms)",
+      "help": "TCP-Timeout fuer Local-Schreibbefehle. Default 2500.",
+      "sm": 12, "md": 3
+    },
+    "_header_compat": {
+      "newLine": true,
+      "type": "header",
+      "size": 3,
+      "text": "State-Layout"
+    },
+    "_info_compat": {
+      "newLine": true,
+      "type": "staticText",
+      "text": "Datenpunkte werden nach iobroker.tuya-Konvention angelegt: <device>.<dps-id> mit common.name = Code-Name. Bestehende Skripte/VIS-Bindings die 'tuya.0.<dev>.20' lesen koennen 1:1 auf 'fid-smartlife.0.<dev>.20' umgestellt werden. Zusaetzlich gibt es lesbare Aliase pro Geraet (on, brightness, temperature, ...) wo sinnvoll. Lokale Settings sind direkt unter dem Geraet: <dev>.ip, <dev>.noLocalConnection, <dev>.localKey, <dev>.localVersion, <dev>.localPort.",
+      "style": { "fontStyle": "italic", "marginBottom": "12px", "color": "#666" }
+    },
+    "_header_debug": {
+      "newLine": true,
+      "type": "header",
+      "size": 3,
+      "text": "Debug"
+    },
+    "debug": {
+      "newLine": true,
+      "type": "checkbox",
+      "label": "Debug-Logging aktivieren",
+      "help": "Zusaetzliche Debug-Meldungen. Loglevel muss auf 'debug' stehen.",
+      "sm": 12, "md": 4
+    }
+  }
+}
