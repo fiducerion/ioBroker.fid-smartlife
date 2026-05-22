@@ -518,15 +518,12 @@ class FiducerionSmartlife extends utils.Adapter {
       if (typeof max === 'number') max /= factor;
     }
 
-    // Primary-State-Pfad bestimmen: DPS-ID wenn vorhanden, sonst Code-Name als
-    // Fallback (z.B. fuer extended-Codes wie 'mode' wo Tuya keine numerische
-    // DPS-ID rausgibt). Tuya-Convention: <device>.<dpsId> mit common.name = code-name.
     const usesDpsId = !!(meta.dpId && String(meta.dpId) !== codeCanon);
     const primaryPath = usesDpsId ? String(meta.dpId) : codeCanon;
+    // tuya-Adapter-Konvention: common.name = code (englisch), chinese Name optional in description
     const displayName = meta.friendly || codeCanon;
 
     const common = {
-      // tuya-Style: name ist Code-Name, role/type wie spezifiziert
       name: displayName,
       type: meta.type,
       role: sm.roleFor(codeCanon, meta.type),
@@ -540,38 +537,57 @@ class FiducerionSmartlife extends utils.Adapter {
     }
     if (Array.isArray(meta.enums) && meta.enums.length) {
       // tuya-Style: enum -> number mit common.states {idx: label}
-      // (vorher: {label: label} - das ist nicht standard fuer ioBroker)
       const st = {};
       meta.enums.forEach((val, idx) => { st[idx] = val; });
       common.states = st;
     }
-    // bitmap-Type: zentraler number-State, Roh-Bits zaehlen
     if (meta.isBitmap) {
       common.type = 'number';
       common.role = 'state';
     }
-    // raw-Type: string mit encoding base64
     if (meta.encoding === 'base64') {
       common.encoding = 'base64';
     }
+    // Chinesischer Name als desc (informativ)
+    if (meta.chineseName && meta.chineseName !== displayName) {
+      common.desc = meta.chineseName;
+    }
 
-    await this.setObjectNotExistsAsync(deviceId + '.' + primaryPath, {
-      type: 'state', common: common, native: { code: codeCanon, dpId: meta.dpId || null }
-    });
+    const fullId = deviceId + '.' + primaryPath;
+    const native = { code: codeCanon, dpId: meta.dpId || null };
+    // setObjectAsync ueberschreibt das Object komplett - das ist hier gewuenscht
+    // damit Schema-Updates (neue enums, geaenderte Typen, neue Namen) wirklich
+    // im Objekt-Store landen. setObjectNotExistsAsync wuerde alte States stehen
+    // lassen mit veralteten/chinesischen Namen oder zu kurzer enum-Liste.
+    // Wenn schon existiert: native+common.history beibehalten damit User-Edits
+    // (z.B. eigener Name, history-Einstellungen) nicht weggeraeumt werden.
+    const existing = await this.getObjectAsync(fullId).catch(() => null);
+    if (existing && existing.common) {
+      // History/custom-Felder preserven
+      if (existing.common.custom) common.custom = existing.common.custom;
+    }
+    await this.setObjectAsync(fullId, {
+      type: 'state',
+      common: common,
+      native: Object.assign({}, (existing && existing.native) || {}, native)
+    }).catch(() => {});
 
     // Bitmap-Unterstaates anlegen (tuya-Style: <primary>-0, <primary>-1, ...)
     if (meta.isBitmap && Array.isArray(meta.bitmapLabels)) {
       for (let i = 0; i < meta.bitmapLabels.length; i++) {
         const label = meta.bitmapLabels[i];
-        await this.setObjectNotExistsAsync(deviceId + '.' + primaryPath + '-' + i, {
-          type: 'state',
-          common: {
-            name: displayName + ' ' + label + ' ' + i,
-            type: 'boolean', role: 'indicator',
-            read: true, write: false
-          },
-          native: { bitmapParent: primaryPath, bitIndex: i, label: label }
-        });
+        const bitFullId = deviceId + '.' + primaryPath + '-' + i;
+        const bitCommon = {
+          name: codeCanon + (meta.chineseName ? ' ' + meta.chineseName : '') + ' ' + label,
+          type: 'boolean', role: 'indicator',
+          read: true, write: false
+        };
+        const bitNative = { bitmapParent: primaryPath, bitIndex: i, label: label };
+        const exB = await this.getObjectAsync(bitFullId).catch(() => null);
+        if (exB && exB.common && exB.common.custom) bitCommon.custom = exB.common.custom;
+        await this.setObjectAsync(bitFullId, {
+          type: 'state', common: bitCommon, native: bitNative
+        }).catch(() => {});
       }
     }
 
@@ -580,11 +596,14 @@ class FiducerionSmartlife extends utils.Adapter {
     if (enh) {
       for (const def of enh) {
         const derivedKey = primaryPath + def.postfix;
-        await this.setObjectNotExistsAsync(deviceId + '.' + derivedKey, {
-          type: 'state',
-          common: Object.assign({ name: displayName + ' ' + def.postfix }, def.common),
-          native: { derivedFrom: primaryPath, code: codeCanon }
-        });
+        const derivedFullId = deviceId + '.' + derivedKey;
+        const derivedCommon = Object.assign({ name: displayName + ' ' + def.postfix }, def.common);
+        const derivedNative = { derivedFrom: primaryPath, code: codeCanon };
+        const exD = await this.getObjectAsync(derivedFullId).catch(() => null);
+        if (exD && exD.common && exD.common.custom) derivedCommon.custom = exD.common.custom;
+        await this.setObjectAsync(derivedFullId, {
+          type: 'state', common: derivedCommon, native: derivedNative
+        }).catch(() => {});
       }
     }
   }

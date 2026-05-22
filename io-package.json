@@ -1,8 +1,12 @@
 {
   "common": {
     "name": "fid-smartlife",
-    "version": "0.6.1",
+    "version": "0.6.2",
     "news": {
+      "0.6.2": {
+        "de": "v0.6.2: (1) State-Namen englisch: jetzt 'Power', 'pm25', 'windspeed' statt der chinesischen Originale wie '开关', '睡眠'. Die Chinese-Originale werden in common.desc fuer Doku abgelegt. Code-Name (englisch) entspricht exakt dem iobroker.tuya-Adapter. (2) Color-Postprocessor (5-rgb / 24-rgb) wird nur noch bei DPs angelegt die tatsaechlich Color-Codes haben (colour_data, colour). Vorher wurde z.B. bei Klima-Geraeten faelschlich ein '5-rgb' angelegt obwohl DP 5 dort windspeed ist. (3) Schema-Updates greifen jetzt: ensureCodeState nutzt setObjectAsync statt setObjectNotExistsAsync. Damit werden enum-Listen, min/max, role und common.name bei Adapter-Updates wirklich angepasst. Vorher blieben alte zu kurze enum-Listen (z.B. windspeed mit 6 statt 8 Werten) stehen. User-Eigenschaften wie history (common.custom) und native werden dabei beibehalten.",
+        "en": "v0.6.2: (1) State names in English now ('Power', 'pm25', 'windspeed' instead of chinese originals). Chinese originals preserved in common.desc. (2) Color postprocessor only applied to actual color DPs (colour_data/colour), no more false '5-rgb' on AC devices. (3) Schema updates now apply: setObjectAsync instead of setObjectNotExistsAsync, so enum lists, min/max, role etc. get updated on adapter upgrade. User properties (common.custom for history) preserved."
+      },
       "0.6.1": {
         "de": "Hotfix: this.log.bind ist keine Function (this.log ist Object {info,warn,...}). Verursachte 'this.log.bind is not a function' bei JEDEM Device-Setup, alle Geraete failed, 0 Geraete in der Discovery.",
         "en": "Hotfix: this.log.bind is not a function (this.log is an Object). Crashed every device setup, 0 devices discovered."
