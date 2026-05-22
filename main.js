@@ -343,7 +343,11 @@ class FiducerionSmartlife extends utils.Adapter {
     const spec = await this.cloud.getSpecification(id);
     const rawSchema = Array.isArray(raw && raw.schema) ? raw.schema : null;
     const productKey = (raw && (raw.productKey || raw.product_id || raw.productId)) || null;
-    const defs = sm.mergeSchemaSources(spec, rawSchema, productKey, this.log.bind(this));
+    // Logger-Adapter: this.log ist Object {info, warn, debug, error}, kein bindbares fn
+    const _log = (level, msg) => {
+      try { (this.log[level] || this.log.debug || (() => {}))(msg); } catch (e) {}
+    };
+    const defs = sm.mergeSchemaSources(spec, rawSchema, productKey, _log);
     if (this.config && this.config.verboseSchema) {
       this.log.info('Schema ' + name + ' (' + id + '): spec=' + ((spec && (spec.functions||[]).length + (spec.status||[]).length) || 0)
         + ' raw=' + (rawSchema ? rawSchema.length : 0)

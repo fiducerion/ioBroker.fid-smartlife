@@ -1,8 +1,12 @@
 {
   "common": {
     "name": "fid-smartlife",
-    "version": "0.6.0",
+    "version": "0.6.1",
     "news": {
+      "0.6.1": {
+        "de": "Hotfix: this.log.bind ist keine Function (this.log ist Object {info,warn,...}). Verursachte 'this.log.bind is not a function' bei JEDEM Device-Setup, alle Geraete failed, 0 Geraete in der Discovery.",
+        "en": "Hotfix: this.log.bind is not a function (this.log is an Object). Crashed every device setup, 0 devices discovered."
+      },
       "0.6.0": {
         "de": "v0.6.0: Cloud-Adapter holt jetzt das vollstaendige Schema in 3 Stufen: (1) Raw-Schema direkt aus device.schema (kommt mit listDevices), das ist meist am vollstaendigsten. (2) Cloud-Spec /v1.0/iot-03/devices/<id>/specification als Erweiterung. (3) productKey-Lookup in lokaler schema.json (31 MB, 8246 Eintraege) als Fallback. Damit erscheinen jetzt ALLE States die der iobroker.tuya-Adapter auch hat - z.B. bei Klima-Geraeten wind, windspeed, pm25, sleep, markbit, money, energy, totalN/P, fault2, up_down_sweep, left_right_sweep, hot_cold_wind, dirty_filter, airquality (vorher nur 9 DPs, jetzt 30). Bitmap-Support: DPs vom Typ 'bitmap' (z.B. markbit, fault) bekommen einen zentralen number-State plus pro Bit einen <primary>-N boolean-State. Color-States: DPs mit ID 5 oder 24 (Farbcode hex) bekommen einen zusaetzlichen <dpsId>-rgb State im Format #rrggbb. Schreiben auf -rgb konvertiert zurueck zum DP-Format. Vorbild ist enhanced_logic.js aus iobroker.tuya. Phase-Power-Sensor: Energy-Plug DPs phase_a/b/c (base64-encoded) bekommen <code>-voltage/-current/-power/-frequency Komfort-States. ENUM-Werte werden jetzt als number (Index) gespeichert mit common.states Mapping - kompatibel zum Tuya-Adapter, Bidirektional konvertiert beim mirror + write.",
         "en": "v0.6.0: Cloud adapter now fetches full schema in 3 stages: raw schema from device.schema (most complete), cloud spec as extension, productKey lookup in local schema.json (31 MB, 8246 entries) as fallback. Climate devices now show 30 DPs instead of 9. Bitmap support for fault codes (markbit, fault) with per-bit boolean states. Color DPs (id 5 or 24) get an additional <id>-rgb state as #rrggbb. Phase power sensor DPs get -voltage/-current/-power derived states. ENUM stored as number index with common.states mapping, compatible with iobroker.tuya adapter, bidirectional conversion on mirror + write."
