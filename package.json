@@ -1,6 +1,6 @@
 {
   "name": "iobroker.fid-smartlife",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "description": "Fiducerion Smartlife - Tuya Cloud Adapter (Teil von Fiducerion Core)",
   "author": {
     "name": "Bernd",

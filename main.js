@@ -26,6 +26,7 @@ const TuyaCloud  = require('./lib/tuyaCloud');
 const tuyaLocal  = require('./lib/tuyaLocal');
 const lanDiscovery = require('./lib/lanDiscovery');
 const sm         = require('./lib/specMapper');
+const enhanced   = require('./lib/enhanced');
 
 class FiducerionSmartlife extends utils.Adapter {
 
@@ -278,11 +279,22 @@ class FiducerionSmartlife extends utils.Adapter {
       const prefix = this.namespace + '.' + did + '.';
       // Welche Pfade sollen erhalten bleiben?
       const keepSet = new Set();
-      // - Alle DPS-ID-Pfade
+      // - Alle DPS-ID-Pfade  (+ enhanced derived + bitmap bits)
       for (const c of dev.defCanonSet) {
         const meta = dev.dpMeta[c];
         const primary = (meta && meta.dpId && String(meta.dpId) !== c) ? String(meta.dpId) : c;
         keepSet.add(primary);
+        // Enhanced derived states (z.B. '5-rgb', '24-rgb', 'phase_a-voltage')
+        const enh = enhanced.getEnhanced(meta && meta.dpId, c);
+        if (enh) {
+          for (const def of enh) keepSet.add(primary + def.postfix);
+        }
+        // Bitmap-bit states '110-0' bis '110-23'
+        if (meta && meta.isBitmap && Array.isArray(meta.bitmapLabels)) {
+          for (let i = 0; i < meta.bitmapLabels.length; i++) {
+            keepSet.add(primary + '-' + i);
+          }
+        }
       }
       // - Alle Aliase
       for (const a of Object.keys(dev.alias || {})) {
@@ -325,9 +337,19 @@ class FiducerionSmartlife extends utils.Adapter {
     });
     await this.extendObjectAsync(id, { common: { name: name } });
 
-    // Spec laden
+    // Spec laden + Raw-Schema aus dem listDevices-Eintrag verwenden +
+    // productKey-Fallback. mergeSchemaSources prioritisiert raw.schema vor spec
+    // vor SchemaDB.
     const spec = await this.cloud.getSpecification(id);
-    const defs = sm.specToDefs(spec);
+    const rawSchema = Array.isArray(raw && raw.schema) ? raw.schema : null;
+    const productKey = (raw && (raw.productKey || raw.product_id || raw.productId)) || null;
+    const defs = sm.mergeSchemaSources(spec, rawSchema, productKey, this.log.bind(this));
+    if (this.config && this.config.verboseSchema) {
+      this.log.info('Schema ' + name + ' (' + id + '): spec=' + ((spec && (spec.functions||[]).length + (spec.status||[]).length) || 0)
+        + ' raw=' + (rawSchema ? rawSchema.length : 0)
+        + ' productKey=' + (productKey || '?')
+        + ' -> ' + defs.length + ' DPs');
+    }
     const defCanonSet = new Set();
     const dpMeta = Object.create(null);
     const canonToReal = Object.create(null);
@@ -513,14 +535,54 @@ class FiducerionSmartlife extends utils.Adapter {
       if (typeof max === 'number') common.max = max;
     }
     if (Array.isArray(meta.enums) && meta.enums.length) {
+      // tuya-Style: enum -> number mit common.states {idx: label}
+      // (vorher: {label: label} - das ist nicht standard fuer ioBroker)
       const st = {};
-      for (const e of meta.enums) st[e] = e;
+      meta.enums.forEach((val, idx) => { st[idx] = val; });
       common.states = st;
+    }
+    // bitmap-Type: zentraler number-State, Roh-Bits zaehlen
+    if (meta.isBitmap) {
+      common.type = 'number';
+      common.role = 'state';
+    }
+    // raw-Type: string mit encoding base64
+    if (meta.encoding === 'base64') {
+      common.encoding = 'base64';
     }
 
     await this.setObjectNotExistsAsync(deviceId + '.' + primaryPath, {
       type: 'state', common: common, native: { code: codeCanon, dpId: meta.dpId || null }
     });
+
+    // Bitmap-Unterstaates anlegen (tuya-Style: <primary>-0, <primary>-1, ...)
+    if (meta.isBitmap && Array.isArray(meta.bitmapLabels)) {
+      for (let i = 0; i < meta.bitmapLabels.length; i++) {
+        const label = meta.bitmapLabels[i];
+        await this.setObjectNotExistsAsync(deviceId + '.' + primaryPath + '-' + i, {
+          type: 'state',
+          common: {
+            name: displayName + ' ' + label + ' ' + i,
+            type: 'boolean', role: 'indicator',
+            read: true, write: false
+          },
+          native: { bitmapParent: primaryPath, bitIndex: i, label: label }
+        });
+      }
+    }
+
+    // Enhanced-postprocessor-derived states (color-rgb, phase-power etc.)
+    const enh = enhanced.getEnhanced(meta.dpId, codeCanon);
+    if (enh) {
+      for (const def of enh) {
+        const derivedKey = primaryPath + def.postfix;
+        await this.setObjectNotExistsAsync(deviceId + '.' + derivedKey, {
+          type: 'state',
+          common: Object.assign({ name: displayName + ' ' + def.postfix }, def.common),
+          native: { derivedFrom: primaryPath, code: codeCanon }
+        });
+      }
+    }
   }
 
   async ensureAliasState(deviceId, deviceName, aliasKey, aliasMeta) {
@@ -633,7 +695,24 @@ class FiducerionSmartlife extends utils.Adapter {
       // Wert konvertieren - defensiver Typ-Coerce damit kein "type mismatch" Error
       let v = s.value;
       const meta = dev.dpMeta[c];
-      if (meta.type === 'number') {
+
+      // ENUM: Tuya schickt im Status den String-Namen (z.B. 'cold'). Wir speichern
+      // als number (Index). Konvertierung via meta.enums oder common.states.
+      if (meta.type === 'number' && Array.isArray(meta.enums) && typeof v === 'string') {
+        const idx = meta.enums.indexOf(v);
+        if (idx >= 0) {
+          v = idx;
+        } else {
+          // Wert nicht in der Liste - versuche es als reine Zahl zu interpretieren
+          const n = Number(v);
+          if (!isNaN(n) && v.trim() !== '') {
+            v = n;
+          } else {
+            this.log.debug('ENUM ' + dev.id + '.' + c + ': Wert "' + v + '" nicht in [' + meta.enums.join(',') + '], skip');
+            continue;
+          }
+        }
+      } else if (meta.type === 'number') {
         if (typeof v === 'number') {
           v = sm.scaleOut(meta, v);
         } else if (typeof v === 'string') {
@@ -664,6 +743,33 @@ class FiducerionSmartlife extends utils.Adapter {
       const meta2 = dev.dpMeta[c];
       const primary = (meta2 && meta2.dpId && String(meta2.dpId) !== c) ? String(meta2.dpId) : c;
       await this.setStateAsync(dev.id + '.' + primary, { val: v, ack: true });
+
+      // Bitmap: jedes Bit als <primary>-N boolean state setzen
+      if (meta2 && meta2.isBitmap && typeof v === 'number' && Array.isArray(meta2.bitmapLabels)) {
+        for (let i = 0; i < meta2.bitmapLabels.length; i++) {
+          const bit = (v & (1 << i)) !== 0;
+          await this.setStateAsync(dev.id + '.' + primary + '-' + i, { val: bit, ack: true }).catch(() => {});
+        }
+      }
+
+      // Enhanced-postprocessors: derived states fuettern
+      const enh = enhanced.getEnhanced(meta2 && meta2.dpId, c);
+      if (enh) {
+        // Roh-Wert vom Adapter ist normalerweise das was wir gerade auch in primary
+        // geschrieben haben (z.B. der hex-string). Aber wenn das ein number-State
+        // ist, hat scaleOut den Wert schon angefasst - wir wollen den UNGESKAlten
+        // Original-Roh-Wert. Tuya schickt Color als String, daher meist OK.
+        const rawVal = s.value;  // Original aus dem Status-Eintrag
+        for (const def of enh) {
+          try {
+            const derivedVal = def.fromDp ? def.fromDp(rawVal) : null;
+            if (derivedVal === null || typeof derivedVal === 'undefined') continue;
+            await this.setStateAsync(dev.id + '.' + primary + def.postfix, { val: derivedVal, ack: true });
+          } catch (e) {
+            this.log.debug('enhanced postprocess ' + dev.id + '.' + primary + def.postfix + ': ' + e.message);
+          }
+        }
+      }
     }
 
     // Aliase mit aktuellen Werten fuettern - sonst bleiben sie leer und sehen
@@ -755,6 +861,26 @@ class FiducerionSmartlife extends utils.Adapter {
       return;
     }
 
+    // Derived enhanced-state? (z.B. '5-rgb' -> Color schreiben auf DPS-ID 5)
+    const enhMatch = enhanced.findEnhancedForDerived(code);
+    if (enhMatch && enhMatch.def && enhMatch.def.toDp) {
+      const encoded = enhMatch.def.toDp(state.val);
+      if (encoded !== null && encoded !== undefined) {
+        const targetCanon = dev.dpIdToCanon && dev.dpIdToCanon[enhMatch.dpId];
+        if (targetCanon) {
+          // Bei Color-Writes optimistisch auch den derived state ack-en
+          if (this.config && this.config.optimisticAck) {
+            await this.setStateAsync(id, { val: state.val, ack: true });
+            await this.setStateAsync(dev.id + '.' + enhMatch.dpId, { val: encoded, ack: true });
+          }
+          await this.handleDirectWrite(dev, targetCanon, encoded);
+        } else {
+          this.log.debug('Derived write ' + code + ': kein DPS-ID-Mapping fuer ' + enhMatch.dpId);
+        }
+      }
+      return;
+    }
+
     // DPS-ID-Write? (Primary-State - das ist der "richtige" Write-Pfad jetzt)
     if (dev.dpIdToCanon && dev.dpIdToCanon[code]) {
       const targetCanon = dev.dpIdToCanon[code];
@@ -821,7 +947,14 @@ class FiducerionSmartlife extends utils.Adapter {
       try {
         const meta = dev.dpMeta[codeCanon];
         let writeVal = value;
-        if (typeof value === 'number') writeVal = sm.scaleIn(meta, value);
+
+        // ENUM-Reverse: User schreibt number-Index, Tuya erwartet String-Name
+        if (meta && Array.isArray(meta.enums) && typeof value === 'number'
+            && Number.isInteger(value) && value >= 0 && value < meta.enums.length) {
+          writeVal = meta.enums[value];
+        } else if (typeof value === 'number') {
+          writeVal = sm.scaleIn(meta, value);
+        }
 
         if (this.config.optimisticAck) {
           const primary = (meta && meta.dpId && String(meta.dpId) !== codeCanon) ? String(meta.dpId) : codeCanon;
