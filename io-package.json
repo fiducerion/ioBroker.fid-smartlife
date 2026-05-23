@@ -1,8 +1,12 @@
 {
   "common": {
     "name": "fid-smartlife",
-    "version": "0.6.3",
+    "version": "0.6.4",
     "news": {
+      "0.6.4": {
+        "de": "v0.6.4: Default-Wechsel fuer lokales Polling. noLocalConnection-Default ist jetzt FALSE (vorher TRUE). Bei v0.6.4-Update wird einmalig fuer alle Devices mit privater IP + localKey + version 3.3 der State noLocalConnection auf false gesetzt, damit lokales DP_QUERY (cmd 0x0a) versucht wird - dann bekommt der Adapter alle DPs vom Geraet statt nur den Cloud-Status-Subset. Auto-Failover: scheitert lokales Polling 3x in Folge, wird das Geraet automatisch auf noLocalConnection=true gestellt und der Adapter faellt auf cloud-only zurueck. Migration-Marker: info.localMigrationV064.",
+        "en": "v0.6.4: Default for noLocalConnection flipped to false. One-time migration to enable local polling for all devices with private IP + localKey. Auto-failover to cloud-only after 3 consecutive local poll failures."
+      },
       "0.6.3": {
         "de": "v0.6.3: KRITISCHER FIX fuer komplexe Geraete (Klimagerate, Stromzaehler-Steckdosen, Multi-Channel-Switches). Adapter macht jetzt zusaetzlich zum Cloud-getStatus ein LOKALES DP_QUERY (cmd 0x0a) ueber TCP. Vorher lieferte die Tuya-Cloud-API nur den Standard-Status-Subset (z.B. nur DPs 2,3,4,18 bei einem 30-DP Air-Conditioner). Mit lokalem Status-Read werden alle DPs in einem Polling-Zyklus erfasst - dann haben States echte Werte statt '?'. Polling-Reihenfolge: 1) lokal (wenn ip+localKey + version 3.3 + noLocalConnection=false) 2) cloud-fallback wenn lokal scheitert oder unterdrueckt. Geraete mit noLocalConnection=true (vom User abgeschaltet) bleiben weiter rein cloud-basiert.",
         "en": "v0.6.3: Local DP_QUERY (TCP cmd 0x0a) for complete DP status. Replaces cloud-only polling which only returned a subset of DPs for complex devices."

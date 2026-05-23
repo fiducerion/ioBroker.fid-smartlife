@@ -132,6 +132,11 @@ class FiducerionSmartlife extends utils.Adapter {
       await this.setStateAsync('info.connection', { val: true, ack: true });
       this.log.info('Initial-Setup fertig: ' + this.devices.size + ' Geraete');
 
+      // Migration v0.6.4: alle Devices mit privater IP + localKey + version 3.3
+      // einmalig auf noLocalConnection=false stellen, damit lokales DP_QUERY
+      // versucht wird. User-Override bleibt erhalten falls Migration schon lief.
+      await this.migrateNoLocalConnectionV064();
+
       // Periodisches Polling
       const pollMs = Math.max(10, Number(cfg.pollIntervalSec) || 60) * 1000;
       this.pollTimer = this.setInterval(() => this.pollAll().catch(e => this.log.warn('Poll-Cycle: ' + e.message)), pollMs);
@@ -472,7 +477,7 @@ class FiducerionSmartlife extends utils.Adapter {
     });
 
     await def('ip',                 { type: 'string',  role: 'info.ip',          write: true });
-    await def('noLocalConnection',  { type: 'boolean', role: 'switch.enable',    write: true }, true);
+    await def('noLocalConnection',  { type: 'boolean', role: 'switch.enable',    write: true }, false);
     await def('localKey',           { type: 'string',  role: 'text',             write: true }, String(raw.local_key || ''));
     await def('localVersion',       { type: 'string',  role: 'text',             write: true }, '3.3');
     await def('localPort',          { type: 'number',  role: 'value',            write: true }, tuyaLocal.DEFAULT_PORT);
@@ -490,9 +495,11 @@ class FiducerionSmartlife extends utils.Adapter {
     const key               = String(await v('localKey', raw && raw.local_key || ''));
     const version           = String(await v('localVersion', '3.3'));
     const port              = Number(await v('localPort', tuyaLocal.DEFAULT_PORT));
-    // tuya-Konvention: noLocalConnection = "Local NICHT verwenden". Wir
-    // intern: preferLocal = "Local bevorzugen". Also umkehren.
-    const noLocal           = !!(await v('noLocalConnection', true));
+    // tuya-Konvention: noLocalConnection = "Local NICHT verwenden". Default ab v0.6.4
+    // ist FALSE - also lokal bevorzugen, wie tuya-Adapter es macht. Wenn das
+    // Gerät lokal nicht erreichbar ist (3x fail), wird der State automatisch
+    // auf true gesetzt und der Adapter faellt auf cloud-only zurueck.
+    const noLocal           = !!(await v('noLocalConnection', false));
     const preferLocal       = !noLocal;
     const source            = String(await v('localSource', ''));
 
@@ -639,6 +646,49 @@ class FiducerionSmartlife extends utils.Adapter {
 
   // -------------- Polling --------------
 
+  /**
+   * Einmalige Migration v0.6.4: setzt fuer alle bekannten Devices mit privater IP
+   * und localKey + version 3.3 den State noLocalConnection auf false. Lokales
+   * DP_QUERY (cmd 0x0a) wird dann aktiv. Geraete die NICHT lokal erreichbar sind,
+   * werden vom Adapter selbst per Auto-Failover-Logik (3x fail) zurueck auf true
+   * gesetzt.
+   * Wird nur einmal pro Adapter-Lifetime ausgefuehrt - markiert via Info-State.
+   */
+  async migrateNoLocalConnectionV064() {
+    try {
+      const marker = await this.getStateAsync('info.localMigrationV064').catch(() => null);
+      if (marker && marker.val === true) {
+        this.log.debug('Migration V064 schon erledigt - skip');
+        return;
+      }
+      await this.setObjectNotExistsAsync('info.localMigrationV064', {
+        type: 'state',
+        common: { name: 'Migration v0.6.4 noLocalConnection-Reset done', type: 'boolean', role: 'indicator', read: true, write: false, def: false },
+        native: {}
+      });
+
+      let migrated = 0;
+      for (const id of this.devices.keys()) {
+        const dev = this.devices.get(id);
+        const lc = dev.local || {};
+        if (!lc.ip || !lc.key) continue;
+        if (!tuyaLocal.isPrivateIp(lc.ip)) continue;
+        if (lc.version !== '3.3') continue;
+        // Nur Devices wo noLocalConnection aktuell true ist
+        const cur = await this.getStateAsync(id + '.noLocalConnection').catch(() => null);
+        if (cur && cur.val === true) {
+          await this.setStateAsync(id + '.noLocalConnection', { val: false, ack: true });
+          dev.local.preferLocal = true;
+          migrated++;
+        }
+      }
+      await this.setStateAsync('info.localMigrationV064', { val: true, ack: true });
+      this.log.info('Migration V064: ' + migrated + ' Geraete auf lokales Polling umgestellt (noLocalConnection: true -> false)');
+    } catch (e) {
+      this.log.warn('migrateNoLocalConnectionV064: ' + e.message);
+    }
+  }
+
   async pollAll() {
     if (this.shuttingDown) return;
     const cfg = this.config || {};
@@ -686,6 +736,7 @@ class FiducerionSmartlife extends utils.Adapter {
         if (res && res.ok && res.dps) {
           await this.mirrorStatusDps(dev, res.dps);
           localOk = true;
+          dev._localFailCount = 0;   // reset
           // online=true setzen weil lokal erreichbar
           await this.setStateAsync(id + '.online',           { val: true, ack: true }).catch(() => {});
           await this.setStateAsync(id + '.noLocalConnection',{ val: false, ack: true }).catch(() => {});
@@ -693,10 +744,18 @@ class FiducerionSmartlife extends utils.Adapter {
           await this.setStateAsync(id + '.localLastSeen',    { val: new Date().toISOString(), ack: true }).catch(() => {});
           this.log.debug('Local queryStatus ' + dev.name + ': ' + Object.keys(res.dps).length + ' DPs');
         } else {
+          dev._localFailCount = (dev._localFailCount || 0) + 1;
           await this.setStateAsync(id + '.localLastResult',  { val: 'queryStatus fail: ' + (res && res.reason || 'unknown'), ack: true }).catch(() => {});
-          this.log.debug('Local queryStatus ' + dev.name + ' fail: ' + (res && res.reason));
+          this.log.debug('Local queryStatus ' + dev.name + ' fail #' + dev._localFailCount + ': ' + (res && res.reason));
+          // Auto-Failover: nach 3 lokalen Fails in Folge -> noLocalConnection=true -> cloud-only
+          if (dev._localFailCount >= 3) {
+            await this.setStateAsync(id + '.noLocalConnection', { val: true, ack: true }).catch(() => {});
+            dev.local.preferLocal = false;
+            this.log.info('Auto-Failover: ' + dev.name + ' (' + id + ') 3x lokal fehlgeschlagen - schalte auf cloud-only um');
+          }
         }
       } catch (e) {
+        dev._localFailCount = (dev._localFailCount || 0) + 1;
         this.log.debug('Local queryStatus ' + dev.name + ' exception: ' + e.message);
       }
     }
@@ -712,13 +771,11 @@ class FiducerionSmartlife extends utils.Adapter {
       } catch (e) {
         const msg = String(e && e.message || e).toLowerCase();
         if (msg.includes('function not support')) {
-          // Auto-disable cloud polling fuer dieses Geraet
           dev.noCloudStatusPoll = true;
           await this.setStateAsync(id + '._noCloudStatusPoll', { val: true, ack: true }).catch(() => {});
           this.log.warn('Cloud status poll deaktiviert fuer ' + dev.name + ' (' + id + '): function not support');
           return;
         }
-        // Wenn lokal auch nicht klappt UND cloud auch nicht -> wirklich offline
         if (!localOk) {
           this.log.warn('Poll fehlgeschlagen ' + dev.name + ' (' + id + '): ' + e.message);
         }
