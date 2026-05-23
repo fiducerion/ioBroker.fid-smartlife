@@ -73,6 +73,14 @@ class FiducerionSmartlife extends utils.Adapter {
     try {
       await this.setStateAsync('info.connection', { val: false, ack: true });
 
+      // Cloud-Quota-Status-State (v0.6.5)
+      await this.setObjectNotExistsAsync('info.cloudQuotaPaused', {
+        type: 'state',
+        common: { name: 'Cloud-Quota erschoepft - Schreiben pausiert', type: 'boolean', role: 'indicator', read: true, write: false, def: false },
+        native: {}
+      });
+      await this.setStateAsync('info.cloudQuotaPaused', { val: false, ack: true }).catch(() => {});
+
       const cfg = this.config || {};
       if (!cfg.clientId || !cfg.clientSecret) {
         this.log.error('Bitte Tuya Access ID + Access Secret in der Adapter-Konfiguration eintragen.');
@@ -136,6 +144,14 @@ class FiducerionSmartlife extends utils.Adapter {
       // einmalig auf noLocalConnection=false stellen, damit lokales DP_QUERY
       // versucht wird. User-Override bleibt erhalten falls Migration schon lief.
       await this.migrateNoLocalConnectionV064();
+
+      // Migration v0.6.5: Reset aller Auto-Failover-Markierungen.
+      // Hintergrund: in v0.6.4 hat die Auto-Failover-Logik ("3x lokal fail ->
+      // noLocalConnection=true") bei einem temporaeren Netz-Ruckler reihenweise
+      // Devices auf cloud-only umgestellt. Das hat die Tuya-Cloud-Quota
+      // erschoepft (98 Devices -> Burst). v0.6.5 setzt einmalig alle wieder
+      // auf false und nutzt den neuen smarten Failover (temporaer, 5min).
+      await this.migrateResetFailoverV065();
 
       // Periodisches Polling
       const pollMs = Math.max(10, Number(cfg.pollIntervalSec) || 60) * 1000;
@@ -689,6 +705,49 @@ class FiducerionSmartlife extends utils.Adapter {
     }
   }
 
+  /**
+   * Migration v0.6.5: Reset aller akkumulierten Auto-Failover-Flags.
+   * In v0.6.4 hat der Failover Devices DAUERHAFT cloud-only gemacht.
+   * v0.6.5 hat smartere temporaere Failover-Logik - daher einmal alles zurueck.
+   * Wird nur einmal ausgefuehrt - markiert via info.localResetV065.
+   */
+  async migrateResetFailoverV065() {
+    try {
+      const marker = await this.getStateAsync('info.localResetV065').catch(() => null);
+      if (marker && marker.val === true) {
+        this.log.debug('Migration V065 schon erledigt - skip');
+        return;
+      }
+      await this.setObjectNotExistsAsync('info.localResetV065', {
+        type: 'state',
+        common: { name: 'Migration v0.6.5 Failover-Reset done', type: 'boolean', role: 'indicator', read: true, write: false, def: false },
+        native: {}
+      });
+
+      let reset = 0;
+      for (const id of this.devices.keys()) {
+        const dev = this.devices.get(id);
+        const lc = dev.local || {};
+        if (!lc.ip || !lc.key) continue;
+        if (!tuyaLocal.isPrivateIp(lc.ip)) continue;
+        if (lc.version !== '3.3') continue;
+        const cur = await this.getStateAsync(id + '.noLocalConnection').catch(() => null);
+        if (cur && cur.val === true) {
+          await this.setStateAsync(id + '.noLocalConnection', { val: false, ack: true });
+          dev.local.preferLocal = true;
+          if (dev._localFailCount) dev._localFailCount = 0;
+          if (dev._cloudOnlyUntil) dev._cloudOnlyUntil = 0;
+          if (dev._failoverHourCount) dev._failoverHourCount = 0;
+          reset++;
+        }
+      }
+      await this.setStateAsync('info.localResetV065', { val: true, ack: true });
+      this.log.info('Migration V065: ' + reset + ' Geraete Auto-Failover-Flag zurueckgesetzt (lokales Polling reaktiviert)');
+    } catch (e) {
+      this.log.warn('migrateResetFailoverV065: ' + e.message);
+    }
+  }
+
   async pollAll() {
     if (this.shuttingDown) return;
     const cfg = this.config || {};
@@ -723,7 +782,15 @@ class FiducerionSmartlife extends utils.Adapter {
     const version = localCfg.version || '3.3';
     const port    = localCfg.port || 6668;
     const preferLocal = localCfg.preferLocal !== false;   // default true
-    if (preferLocal && ip && key && version === '3.3') {
+
+    // Smarter Failover-Check v0.6.5:
+    // Falls Device aktuell in temporaerem Cloud-Mode (_cloudOnlyUntil > now),
+    // skipped wir den Local-Versuch in diesem Poll-Zyklus. Nach dem Ablauf
+    // probieren wir wieder.
+    const now = Date.now();
+    const inTempCloudMode = (dev._cloudOnlyUntil || 0) > now;
+
+    if (preferLocal && !inTempCloudMode && ip && key && version === '3.3') {
       try {
         const res = await tuyaLocal.queryStatus({
           ip: ip,
@@ -747,11 +814,30 @@ class FiducerionSmartlife extends utils.Adapter {
           dev._localFailCount = (dev._localFailCount || 0) + 1;
           await this.setStateAsync(id + '.localLastResult',  { val: 'queryStatus fail: ' + (res && res.reason || 'unknown'), ack: true }).catch(() => {});
           this.log.debug('Local queryStatus ' + dev.name + ' fail #' + dev._localFailCount + ': ' + (res && res.reason));
-          // Auto-Failover: nach 3 lokalen Fails in Folge -> noLocalConnection=true -> cloud-only
+          // Smarter Auto-Failover v0.6.5:
+          // 3x in Folge fail -> TEMPORAER 5min cloud, danach wieder lokal probieren.
+          // Max 3 Failover-Zyklen pro Stunde, danach bleibts cloud bis Adapter-Restart.
+          // Vorteil: bei kurzem Netzaussetzer schaltet sich Local automatisch wieder ein
+          // ohne dass die Tuya-Cloud-Quota erschoepft wird.
           if (dev._localFailCount >= 3) {
-            await this.setStateAsync(id + '.noLocalConnection', { val: true, ack: true }).catch(() => {});
-            dev.local.preferLocal = false;
-            this.log.info('Auto-Failover: ' + dev.name + ' (' + id + ') 3x lokal fehlgeschlagen - schalte auf cloud-only um');
+            const hour = Math.floor(now / 3600000);
+            if (dev._failoverHour !== hour) {
+              dev._failoverHour = hour;
+              dev._failoverHourCount = 0;
+            }
+            dev._failoverHourCount = (dev._failoverHourCount || 0) + 1;
+            dev._localFailCount = 0;   // counter reset, next try wieder von 0
+
+            if (dev._failoverHourCount > 3) {
+              // 3 Failover-Zyklen in dieser Stunde - jetzt erst PERMANENT auf cloud-only
+              await this.setStateAsync(id + '.noLocalConnection', { val: true, ack: true }).catch(() => {});
+              dev.local.preferLocal = false;
+              this.log.info('Auto-Failover (permanent): ' + dev.name + ' (' + id + ') 3x Failover in 1h - cloud-only');
+            } else {
+              // Temporaer 5min auf cloud, dann auto-retry lokal
+              dev._cloudOnlyUntil = now + 5 * 60 * 1000;
+              this.log.debug('Auto-Failover (temp 5min): ' + dev.name + ' - lokal mehrfach gescheitert');
+            }
           }
         }
       } catch (e) {
@@ -760,8 +846,13 @@ class FiducerionSmartlife extends utils.Adapter {
       }
     }
 
-    // Schritt 2: Cloud nur wenn lokal fehlgeschlagen ODER User es nicht abgeschaltet hat
+    // Schritt 2: Cloud nur wenn lokal fehlgeschlagen ODER User es nicht abgeschaltet hat.
+    // Cloud-Polling pausiert wenn Quota erschoepft (v0.6.5).
     if (!localOk && !skipCloud) {
+      if (this._cloudQuotaPausedUntil && Date.now() < this._cloudQuotaPausedUntil) {
+        // Stilles skip - wir loggen den Quota-Status zentral im sendDeviceCommands
+        return;
+      }
       try {
         const status = await this.cloud.getStatus(id);
         await this.mirrorStatus(dev, status);
@@ -774,6 +865,13 @@ class FiducerionSmartlife extends utils.Adapter {
           dev.noCloudStatusPoll = true;
           await this.setStateAsync(id + '._noCloudStatusPoll', { val: true, ack: true }).catch(() => {});
           this.log.warn('Cloud status poll deaktiviert fuer ' + dev.name + ' (' + id + '): function not support');
+          return;
+        }
+        if (msg.includes('quota') || msg.includes('exceeded') || msg.includes('rate limit')) {
+          this._cloudQuotaPausedUntil = Date.now() + 60 * 60 * 1000;
+          this._lastQuotaWarnTs = Date.now();
+          await this.setStateAsync('info.cloudQuotaPaused', { val: true, ack: true }).catch(() => {});
+          this.log.warn('Cloud-Quota erschoepft beim Polling: ' + (e.message || e) + '. Pausiert fuer 60 Minuten.');
           return;
         }
         if (!localOk) {
@@ -1230,12 +1328,58 @@ class FiducerionSmartlife extends utils.Adapter {
       }
     }
 
-    // Cloud-Pfad
+    // Cloud-Pfad: mit Quota-Guard + globalem Throttle (v0.6.5)
+    await this._cloudThrottleWait();
+    if (this._cloudQuotaPausedUntil && Date.now() < this._cloudQuotaPausedUntil) {
+      const minLeft = Math.ceil((this._cloudQuotaPausedUntil - Date.now()) / 60000);
+      const msg = 'Cloud Quota erschoepft - Schreiben fuer ' + minLeft + 'min pausiert';
+      // Nur 1x pro 10 Min loggen
+      const now = Date.now();
+      if (!this._lastQuotaWarnTs || (now - this._lastQuotaWarnTs) > 10 * 60000) {
+        this._lastQuotaWarnTs = now;
+        this.log.warn('Cloud-Write ' + dev.name + ' uebersprungen: ' + msg);
+      }
+      await this.setStateAsync(dev.id + '.localLastResult', { val: msg, ack: true }).catch(() => {});
+      throw new Error(msg);
+    }
+    // Wenn Backoff vorbei: Quota-State zuruecksetzen
+    if (this._cloudQuotaPausedUntil && Date.now() >= this._cloudQuotaPausedUntil) {
+      this._cloudQuotaPausedUntil = 0;
+      await this.setStateAsync('info.cloudQuotaPaused', { val: false, ack: true }).catch(() => {});
+      this.log.info('Cloud-Quota-Pause vorbei - Cloud-Writes wieder aktiv');
+    }
     const cloudCmds = pairs.map(p => ({ code: p.realCode, value: p.value }));
-    await this.cloud.sendCommands(dev.id, cloudCmds);
+    try {
+      await this.cloud.sendCommands(dev.id, cloudCmds);
+    } catch (eCloud) {
+      const m = String(eCloud && eCloud.message || eCloud).toLowerCase();
+      if (m.includes('quota') || m.includes('exceeded') || m.includes('rate limit')) {
+        // Tuya hat unsere Cloud-Calls dichtgemacht. 1h Backoff fuer ALLE Devices.
+        this._cloudQuotaPausedUntil = Date.now() + 60 * 60 * 1000;
+        this._lastQuotaWarnTs = Date.now();
+        await this.setStateAsync('info.cloudQuotaPaused', { val: true, ack: true }).catch(() => {});
+        this.log.warn('Cloud-Quota erschoepft (' + (eCloud.message || eCloud) + '). Cloud-Writes pausiert fuer 60 Minuten.');
+      }
+      throw eCloud;
+    }
     if (dev.local.preferLocal) {
       await this.setStateAsync(dev.id + '.localLastResult', { val: 'cloud fallback used', ack: true });
     }
+  }
+
+  /**
+   * Globaler Cloud-Write-Throttle (v0.6.5): max 1 Cloud-Write pro 500ms.
+   * Damit ein Burst von 10+ Klicks nicht gleichzeitig die Tuya-Quota knallt.
+   */
+  async _cloudThrottleWait() {
+    const MIN_GAP_MS = 500;
+    const now = Date.now();
+    const last = this._lastCloudWriteTs || 0;
+    const wait = (last + MIN_GAP_MS) - now;
+    if (wait > 0) {
+      await new Promise(r => setTimeout(r, wait));
+    }
+    this._lastCloudWriteTs = Date.now();
   }
 
   // -------------- LAN-Discovery --------------
