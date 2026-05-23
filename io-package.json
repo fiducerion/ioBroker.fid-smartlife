@@ -1,8 +1,12 @@
 {
   "common": {
     "name": "fid-smartlife",
-    "version": "0.6.5",
+    "version": "0.7.0",
     "news": {
+      "0.7.0": {
+        "de": "v0.7.0: Tuya Pulsar/MQTT Push-Subscriber (experimentell). Empfaengt Device-Status-Updates per MQTT-Push statt durch Cloud-Polling. Massiv weniger API-Quota - speziell fuer Battery/Subdevices wichtig. Aktivierbar via Setting 'enablePulsar' (default off). Voraussetzung: In der Tuya IoT Platform unter dem Cloud-Project muss der Message Service abonniert sein (kostenlos in Trial-Edition). Implementation: Eigener minimaler MQTT 3.1.1 Client ueber Node's TLS (keine externe Dependency), AES-128-GCM + AES-128-ECB Decryption, Auth via /v1.0/iot-03/open-hub/access-config, Auto-Reconnect mit exponential backoff, Token-Refresh vor expire_time. Status-Updates werden direkt in die States gemirrort - es muss nicht mehr gepollt werden. Status sichtbar unter info.pulsarConnected/.pulsarMessages.",
+        "en": "v0.7.0: Tuya Pulsar/MQTT push subscriber (experimental). Receives device status updates via MQTT push instead of cloud polling. Massive quota savings for battery/subdevices. Enable via 'enablePulsar' setting."
+      },
       "0.6.5": {
         "de": "v0.6.5: Smarter Tuya-Cloud-Schutz gegen Quota-Erschoepfung. Der Auto-Failover aus v0.6.4 (3x lokal fail -> permanent cloud-only) hat bei temporaeren Netz-Aussetzern reihenweise Devices auf cloud-only umgestellt - mit 98 Devices war die Tuya-Trial-Quota in kurzer Zeit weg. (1) Migration V065: einmaliger Reset aller noLocalConnection-Flags - alle Devices probieren wieder lokal. (2) Smarter Failover: 3x lokal fail -> TEMPORAER 5min cloud, danach auto-retry lokal. Erst nach 3 solchen Zyklen in 1h wird auf permanent cloud-only umgestellt. (3) Cloud-Quota-Guard: erkennt 'quota'/'rate limit' Errors und pausiert ALLE Cloud-Writes fuer 60min, Status-State info.cloudQuotaPaused, Warn-Log max 1x pro 10min. (4) Globaler Cloud-Write-Throttle: max 1 Cloud-Schreibversuch pro 500ms.",
         "en": "v0.6.5: Tuya cloud quota protection. Smart failover (temporary 5min), quota guard (60min backoff on rate limit error), global write throttle (500ms gap), migration to reset accumulated failover flags from v0.6.4."
@@ -135,6 +139,7 @@
     "maxParallelPolls": 1,
     "noCloudStatusPollIds": "bf6458jx9qqkvqdc,80270017bcddc2379ee4",
     "enableLanDiscovery": true,
+    "enablePulsar": false,
     "importLocalFromTuyaAdapter": true,
     "localTimeoutMs": 2500,
     "debug": false

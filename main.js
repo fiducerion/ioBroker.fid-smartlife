@@ -23,6 +23,7 @@
 
 const utils      = require('@iobroker/adapter-core');
 const TuyaCloud  = require('./lib/tuyaCloud');
+const TuyaPulsar = require('./lib/tuyaPulsar').TuyaPulsar;
 const tuyaLocal  = require('./lib/tuyaLocal');
 const lanDiscovery = require('./lib/lanDiscovery');
 const sm         = require('./lib/specMapper');
@@ -38,6 +39,8 @@ class FiducerionSmartlife extends utils.Adapter {
 
     /** @type {TuyaCloud|null} */
     this.cloud = null;
+    this.pulsar = null;
+    this.pulsarStats = { msgRx: 0, decryptOk: 0, decryptFail: 0, lastMsgTs: 0 };
 
     /** Map deviceId -> { name, defs, alias, dpMeta, canonToReal, noCloudStatusPoll, local, raw } */
     this.devices = new Map();
@@ -166,6 +169,16 @@ class FiducerionSmartlife extends utils.Adapter {
         }, rdMin * 60 * 1000);
       }
 
+      // ---- Pulsar/MQTT Push-Subscriber (v0.7.0) ----
+      // Wenn aktiviert: holt Status-Updates per MQTT-Push statt per Cloud-Polling.
+      // Massiv weniger Cloud-Quota - besonders fuer Battery/Sub-Devices wichtig.
+      // Default false bis User in Tuya IoT Platform Message Service abonniert hat.
+      if (cfg.enablePulsar) {
+        await this.startPulsar(secret).catch(e =>
+          this.log.warn('Pulsar-Start fehlgeschlagen (Adapter laeuft normal weiter): ' + (e.message || e))
+        );
+      }
+
     } catch (e) {
       this.log.error('onReady fehlgeschlagen: ' + (e && e.stack || e));
       await this.setStateAsync('info.connection', { val: false, ack: true }).catch(() => {});
@@ -226,6 +239,7 @@ class FiducerionSmartlife extends utils.Adapter {
       if (this.pollTimer) { this.clearInterval(this.pollTimer); this.pollTimer = null; }
       if (this.rediscoverTimer) { this.clearInterval(this.rediscoverTimer); this.rediscoverTimer = null; }
       if (this.lanListener) { try { this.lanListener.stop(); } catch (e) {} this.lanListener = null; }
+      if (this.pulsar) { try { this.pulsar.stop(); } catch (e) {} this.pulsar = null; }
       // Alle ausstehenden Debounce-Timer clearen
       for (const k of Object.keys(this.writeTimers)) {
         try { clearTimeout(this.writeTimers[k]); } catch (e) {}
@@ -702,6 +716,109 @@ class FiducerionSmartlife extends utils.Adapter {
       this.log.info('Migration V064: ' + migrated + ' Geraete auf lokales Polling umgestellt (noLocalConnection: true -> false)');
     } catch (e) {
       this.log.warn('migrateNoLocalConnectionV064: ' + e.message);
+    }
+  }
+
+  // -------------- Pulsar / MQTT Push-Subscriber (v0.7.0) --------------
+
+  /**
+   * Startet den TuyaPulsar Subscriber. Holt Auth-Config vom Tuya open-hub,
+   * verbindet sich per MQTT und subscribed auf das device-event topic.
+   * Bei jeder Status-Aenderung kommt eine push-Message - wir muessen nicht mehr
+   * pollen.
+   */
+  async startPulsar(secret) {
+    if (this.pulsar) {
+      this.log.warn('Pulsar laeuft schon - skip start');
+      return;
+    }
+    // Quota-State + Status-States anlegen
+    await this.setObjectNotExistsAsync('info.pulsarConnected', {
+      type: 'state',
+      common: { name: 'Pulsar MQTT-Push aktiv', type: 'boolean', role: 'indicator.connected', read: true, write: false, def: false },
+      native: {}
+    });
+    await this.setObjectNotExistsAsync('info.pulsarMessages', {
+      type: 'state',
+      common: { name: 'Pulsar empfangene Messages (Counter)', type: 'number', role: 'value', read: true, write: false, def: 0 },
+      native: {}
+    });
+    await this.setObjectNotExistsAsync('info.pulsarLastMsg', {
+      type: 'state',
+      common: { name: 'Pulsar letzte Message Zeitstempel', type: 'string', role: 'value.time', read: true, write: false, def: '' },
+      native: {}
+    });
+
+    this.pulsar = new TuyaPulsar({
+      clientId:     this.config.clientId,
+      clientSecret: secret,
+      region:       this.config.region || 'eu',
+      getCloudToken: async () => {
+        if (this.cloud && typeof this.cloud.ensureToken === 'function') {
+          return await this.cloud.ensureToken();
+        }
+        throw new Error('cloud not ready');
+      },
+      logger: (lvl, msg) => this.log[lvl] && this.log[lvl]('[pulsar] ' + msg)
+    });
+    this.pulsar.on('connected', async () => {
+      await this.setStateAsync('info.pulsarConnected', { val: true, ack: true }).catch(()=>{});
+      this.log.info('Pulsar MQTT verbunden - Device-Status-Updates kommen jetzt per Push');
+    });
+    this.pulsar.on('disconnected', async () => {
+      await this.setStateAsync('info.pulsarConnected', { val: false, ack: true }).catch(()=>{});
+    });
+    this.pulsar.on('message', (parsed) => this.onPulsarMessage(parsed).catch(e =>
+      this.log.warn('Pulsar message handler: ' + (e.message || e))
+    ));
+
+    await this.pulsar.start();
+  }
+
+  /**
+   * Verarbeitet eine entschluesselte Pulsar-Message.
+   * Format:
+   *   {dataId, devId, productKey, status: [{code, value, t, ...}]}
+   * oder bei einigen events:
+   *   {bizCode: 'online'|'offline', bizData: {...}, devId: '...'}
+   */
+  async onPulsarMessage(parsed) {
+    this.pulsarStats.msgRx++;
+    this.pulsarStats.lastMsgTs = Date.now();
+    await this.setStateAsync('info.pulsarMessages', { val: this.pulsarStats.msgRx, ack: true }).catch(()=>{});
+    await this.setStateAsync('info.pulsarLastMsg',  { val: new Date().toISOString(), ack: true }).catch(()=>{});
+
+    const devId = parsed.devId || parsed.deviceId || (parsed.bizData && parsed.bizData.devId);
+    if (!devId) {
+      this.log.debug('Pulsar msg ohne devId, keys=' + Object.keys(parsed).join(','));
+      return;
+    }
+    const dev = this.devices.get(devId);
+    if (!dev) {
+      this.log.debug('Pulsar msg fuer unbekanntes Device ' + devId);
+      return;
+    }
+
+    // Status-Report verarbeiten
+    if (Array.isArray(parsed.status) && parsed.status.length > 0) {
+      // Wir konvertieren das Pulsar-Format ({code, value}) in das Format das
+      // unsere mirrorStatus erwartet ({code, value})
+      const statusArr = parsed.status.map(s => ({ code: s.code, value: s.value }));
+      try {
+        await this.mirrorStatus(dev, statusArr);
+        this.log.debug('Pulsar Status ' + dev.name + ': ' + statusArr.length + ' DPs aktualisiert');
+      } catch (e) {
+        this.log.debug('mirrorStatus from pulsar failed: ' + e.message);
+      }
+    }
+
+    // Online/Offline-Events
+    if (parsed.bizCode === 'online') {
+      await this.setStateAsync(devId + '.online', { val: true, ack: true }).catch(()=>{});
+      this.log.debug('Pulsar: ' + dev.name + ' online');
+    } else if (parsed.bizCode === 'offline') {
+      await this.setStateAsync(devId + '.online', { val: false, ack: true }).catch(()=>{});
+      this.log.debug('Pulsar: ' + dev.name + ' offline');
     }
   }
 

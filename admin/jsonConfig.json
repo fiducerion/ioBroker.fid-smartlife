@@ -138,6 +138,25 @@
       "help": "Falls iobroker.tuya parallel laeuft, werden lokale IPs/Versionen beim Start uebernommen.",
       "sm": 12, "md": 6
     },
+    "_header_pulsar": {
+      "newLine": true,
+      "type": "header",
+      "text": "Pulsar / MQTT Push (experimentell)",
+      "size": 4
+    },
+    "_help_pulsar": {
+      "newLine": true,
+      "type": "staticText",
+      "text": "Wenn aktiviert, verbindet sich der Adapter via MQTT mit dem Tuya-Pulsar-Broker und empfaengt Device-Status-Updates per Push (statt per Polling). Voraussetzung: In der Tuya IoT Platform muss unter dem Cloud-Project der Message Service abonniert sein. Spart massiv Cloud-Quota - besonders fuer Battery-/Subdevices wichtig.",
+      "style": { "fontStyle": "italic", "marginBottom": "12px", "color": "#666" }
+    },
+    "enablePulsar": {
+      "newLine": true,
+      "type": "checkbox",
+      "label": "Pulsar/MQTT Push aktivieren",
+      "help": "Voraussetzung: Message Service in Tuya IoT Platform abonniert. Status sichtbar unter info.pulsarConnected.",
+      "sm": 12, "md": 6
+    },
     "localTimeoutMs": {
       "newLine": true,
       "type": "number",
