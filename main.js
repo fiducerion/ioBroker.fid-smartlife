@@ -661,26 +661,166 @@ class FiducerionSmartlife extends utils.Adapter {
     if (!dev) return;
     // Aktuellen _noCloudStatusPoll-Wert respektieren (User kann live umschalten)
     const noPollState = await this.getStateAsync(id + '._noCloudStatusPoll').catch(() => null);
-    if (noPollState && noPollState.val === true) {
-      this.log.debug('Skip cloud status poll for ' + dev.name + ' (' + id + ')');
-      return;
+    const skipCloud = noPollState && noPollState.val === true;
+
+    // Schritt 1: Lokales DP_QUERY (cmd 0x0a) versuchen wenn IP+localKey bekannt.
+    // Liefert ALLE DPs vom Geraet, nicht nur den Cloud-Status-Subset.
+    // User-Flag noLocalConnection respektieren (preferLocal=false -> nicht lokal pollen).
+    let localOk = false;
+    const localCfg = dev.local || {};
+    const ip      = localCfg.ip || (dev.raw && dev.raw.ip);
+    const key     = localCfg.key;
+    const version = localCfg.version || '3.3';
+    const port    = localCfg.port || 6668;
+    const preferLocal = localCfg.preferLocal !== false;   // default true
+    if (preferLocal && ip && key && version === '3.3') {
+      try {
+        const res = await tuyaLocal.queryStatus({
+          ip: ip,
+          localKey: key,
+          deviceId: id,
+          version: '3.3',
+          port: port,
+          timeoutMs: 2500
+        });
+        if (res && res.ok && res.dps) {
+          await this.mirrorStatusDps(dev, res.dps);
+          localOk = true;
+          // online=true setzen weil lokal erreichbar
+          await this.setStateAsync(id + '.online',           { val: true, ack: true }).catch(() => {});
+          await this.setStateAsync(id + '.noLocalConnection',{ val: false, ack: true }).catch(() => {});
+          await this.setStateAsync(id + '.localLastResult',  { val: 'queryStatus ok', ack: true }).catch(() => {});
+          await this.setStateAsync(id + '.localLastSeen',    { val: new Date().toISOString(), ack: true }).catch(() => {});
+          this.log.debug('Local queryStatus ' + dev.name + ': ' + Object.keys(res.dps).length + ' DPs');
+        } else {
+          await this.setStateAsync(id + '.localLastResult',  { val: 'queryStatus fail: ' + (res && res.reason || 'unknown'), ack: true }).catch(() => {});
+          this.log.debug('Local queryStatus ' + dev.name + ' fail: ' + (res && res.reason));
+        }
+      } catch (e) {
+        this.log.debug('Local queryStatus ' + dev.name + ' exception: ' + e.message);
+      }
     }
-    try {
-      const status = await this.cloud.getStatus(id);
-      await this.mirrorStatus(dev, status);
-      if (typeof dev.raw.online !== 'undefined') {
-        await this.setStateAsync(id + '.online', { val: !!dev.raw.online, ack: true });
+
+    // Schritt 2: Cloud nur wenn lokal fehlgeschlagen ODER User es nicht abgeschaltet hat
+    if (!localOk && !skipCloud) {
+      try {
+        const status = await this.cloud.getStatus(id);
+        await this.mirrorStatus(dev, status);
+        if (typeof dev.raw.online !== 'undefined') {
+          await this.setStateAsync(id + '.online', { val: !!dev.raw.online, ack: true });
+        }
+      } catch (e) {
+        const msg = String(e && e.message || e).toLowerCase();
+        if (msg.includes('function not support')) {
+          // Auto-disable cloud polling fuer dieses Geraet
+          dev.noCloudStatusPoll = true;
+          await this.setStateAsync(id + '._noCloudStatusPoll', { val: true, ack: true }).catch(() => {});
+          this.log.warn('Cloud status poll deaktiviert fuer ' + dev.name + ' (' + id + '): function not support');
+          return;
+        }
+        // Wenn lokal auch nicht klappt UND cloud auch nicht -> wirklich offline
+        if (!localOk) {
+          this.log.warn('Poll fehlgeschlagen ' + dev.name + ' (' + id + '): ' + e.message);
+        }
       }
-    } catch (e) {
-      const msg = String(e && e.message || e).toLowerCase();
-      if (msg.includes('function not support')) {
-        // Auto-disable polling fuer dieses Geraet
-        dev.noCloudStatusPoll = true;
-        await this.setStateAsync(id + '._noCloudStatusPoll', { val: true, ack: true }).catch(() => {});
-        this.log.warn('Cloud status poll deaktiviert fuer ' + dev.name + ' (' + id + '): function not support');
-        return;
+    }
+  }
+
+  /**
+   * Mappt ein DP-Map (lokales Format: {1: false, 2: 20, ...}) in die States.
+   * Geht ueber die meta-Daten des Geraets, nicht ueber den canonical-code.
+   */
+  async mirrorStatusDps(dev, dpsMap) {
+    if (!dpsMap || typeof dpsMap !== 'object') return;
+    // Map: dpId -> v (gescaled, fuer Status-Pass)
+    const valuesByDpId = Object.create(null);
+
+    for (const dpId of Object.keys(dpsMap)) {
+      const rawValue = dpsMap[dpId];
+      const dpIdStr = String(dpId);
+
+      // Canonical code finden ueber dev.dpIdToCanon
+      let c = (dev.dpIdToCanon && dev.dpIdToCanon[dpIdStr]) ? dev.dpIdToCanon[dpIdStr] : dpIdStr;
+      let meta = dev.dpMeta[c];
+
+      // Falls die Spec den DP nicht kannte, on-the-fly anlegen
+      if (!meta) {
+        meta = {
+          type: typeof rawValue === 'boolean' ? 'boolean'
+              : typeof rawValue === 'number'  ? 'number' : 'string',
+          writable: false,
+          friendly: 'dp_' + dpIdStr,
+          dpId: dpIdStr
+        };
+        dev.dpMeta[c] = meta;
+        if (!dev.canonToReal[c]) dev.canonToReal[c] = dpIdStr;
+        if (!dev.dpIdToCanon) dev.dpIdToCanon = Object.create(null);
+        dev.dpIdToCanon[dpIdStr] = c;
+        await this.ensureCodeState(dev.id, dev.name, c, meta);
       }
-      this.log.warn('Poll fehlgeschlagen ' + dev.name + ' (' + id + '): ' + e.message);
+
+      // Wert-Coerce
+      let v = rawValue;
+      if (meta.type === 'number') {
+        if (typeof v === 'number') v = sm.scaleOut(meta, v);
+        else if (typeof v === 'string') {
+          const n = Number(v);
+          if (!isNaN(n) && v.trim() !== '') v = sm.scaleOut(meta, n);
+          else { this.log.debug('DPS ' + dev.id + '.' + dpIdStr + ': nicht number-parsebar: ' + v); continue; }
+        } else if (typeof v === 'boolean') v = v ? 1 : 0;
+        else continue;
+      } else if (meta.type === 'boolean') {
+        if (typeof v === 'string') v = ['true', '1', 'on'].includes(v.toLowerCase());
+        else if (typeof v === 'number') v = v !== 0;
+        else v = !!v;
+      } else if (meta.type === 'string') {
+        if (v === null || typeof v === 'undefined') v = '';
+        else if (typeof v !== 'string') v = String(v);
+      }
+
+      valuesByDpId[dpIdStr] = v;
+
+      // Primary state schreiben (dpId, im Tuya-Stil)
+      await this.setStateAsync(dev.id + '.' + dpIdStr, { val: v, ack: true });
+
+      // Bitmap
+      if (meta.isBitmap && typeof v === 'number' && Array.isArray(meta.bitmapLabels)) {
+        for (let i = 0; i < meta.bitmapLabels.length; i++) {
+          const bit = (v & (1 << i)) !== 0;
+          await this.setStateAsync(dev.id + '.' + dpIdStr + '-' + i, { val: bit, ack: true }).catch(() => {});
+        }
+      }
+
+      // Enhanced postprocessors
+      const enh = enhanced.getEnhanced(meta.dpId, c);
+      if (enh) {
+        for (const def of enh) {
+          try {
+            const derivedVal = def.fromDp ? def.fromDp(rawValue) : null;
+            if (derivedVal === null || typeof derivedVal === 'undefined') continue;
+            await this.setStateAsync(dev.id + '.' + dpIdStr + def.postfix, { val: derivedVal, ack: true });
+          } catch (e) { /* ignore */ }
+        }
+      }
+    }
+
+    // Aliase mit aktuellen Werten fuettern - basierend auf dpId-Lookup ueber canonToReal
+    for (const aliasKey of Object.keys(dev.alias || {})) {
+      if (aliasKey.startsWith('_')) continue;
+      const targetCode = dev.alias[aliasKey];
+      const meta = dev.dpMeta[targetCode];
+      if (!meta || !meta.dpId) continue;
+      if (!(meta.dpId in valuesByDpId)) continue;
+      let aliasVal = valuesByDpId[meta.dpId];
+
+      if (aliasKey === 'brightness' && typeof aliasVal === 'number') {
+        if (typeof meta.max === 'number' && meta.max > 100) {
+          const min = typeof meta.min === 'number' ? meta.min : 0;
+          const max = meta.max;
+          if (max !== min) aliasVal = Math.round(((aliasVal - min) / (max - min)) * 100);
+        }
+      }
+      await this.setStateAsync(dev.id + '.' + aliasKey, { val: aliasVal, ack: true });
     }
   }
 

@@ -1,8 +1,12 @@
 {
   "common": {
     "name": "fid-smartlife",
-    "version": "0.6.2",
+    "version": "0.6.3",
     "news": {
+      "0.6.3": {
+        "de": "v0.6.3: KRITISCHER FIX fuer komplexe Geraete (Klimagerate, Stromzaehler-Steckdosen, Multi-Channel-Switches). Adapter macht jetzt zusaetzlich zum Cloud-getStatus ein LOKALES DP_QUERY (cmd 0x0a) ueber TCP. Vorher lieferte die Tuya-Cloud-API nur den Standard-Status-Subset (z.B. nur DPs 2,3,4,18 bei einem 30-DP Air-Conditioner). Mit lokalem Status-Read werden alle DPs in einem Polling-Zyklus erfasst - dann haben States echte Werte statt '?'. Polling-Reihenfolge: 1) lokal (wenn ip+localKey + version 3.3 + noLocalConnection=false) 2) cloud-fallback wenn lokal scheitert oder unterdrueckt. Geraete mit noLocalConnection=true (vom User abgeschaltet) bleiben weiter rein cloud-basiert.",
+        "en": "v0.6.3: Local DP_QUERY (TCP cmd 0x0a) for complete DP status. Replaces cloud-only polling which only returned a subset of DPs for complex devices."
+      },
       "0.6.2": {
         "de": "v0.6.2: (1) State-Namen englisch: jetzt 'Power', 'pm25', 'windspeed' statt der chinesischen Originale wie '开关', '睡眠'. Die Chinese-Originale werden in common.desc fuer Doku abgelegt. Code-Name (englisch) entspricht exakt dem iobroker.tuya-Adapter. (2) Color-Postprocessor (5-rgb / 24-rgb) wird nur noch bei DPs angelegt die tatsaechlich Color-Codes haben (colour_data, colour). Vorher wurde z.B. bei Klima-Geraeten faelschlich ein '5-rgb' angelegt obwohl DP 5 dort windspeed ist. (3) Schema-Updates greifen jetzt: ensureCodeState nutzt setObjectAsync statt setObjectNotExistsAsync. Damit werden enum-Listen, min/max, role und common.name bei Adapter-Updates wirklich angepasst. Vorher blieben alte zu kurze enum-Listen (z.B. windspeed mit 6 statt 8 Werten) stehen. User-Eigenschaften wie history (common.custom) und native werden dabei beibehalten.",
         "en": "v0.6.2: (1) State names in English now ('Power', 'pm25', 'windspeed' instead of chinese originals). Chinese originals preserved in common.desc. (2) Color postprocessor only applied to actual color DPs (colour_data/colour), no more false '5-rgb' on AC devices. (3) Schema updates now apply: setObjectAsync instead of setObjectNotExistsAsync, so enum lists, min/max, role etc. get updated on adapter upgrade. User properties (common.custom for history) preserved."
