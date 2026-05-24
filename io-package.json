@@ -1,8 +1,12 @@
 {
   "common": {
     "name": "fid-smartlife",
-    "version": "0.7.7",
+    "version": "0.7.8",
     "news": {
+      "0.7.8": {
+        "de": "v0.7.8: Public-Release Vorbereitung. README neu auf Englisch (Installation, Tuya-Setup, ALPHA-Warnung, Roadmap). Author/Homepage/Repository auf fiducerion/GitHub. Keine funktionalen Aenderungen am Code.",
+        "en": "v0.7.8: Public release preparation - new README, repository metadata, ALPHA warning."
+      },
       "0.7.7": {
         "de": "v0.7.7: Write-Pfad mit Retries gegen Cloud-Quota-Wand.\nVorher: 1 lokaler Schreibversuch -> sofort Cloud-Fallback. Bei Blink-Scripts (3s-Takt) reichte ein kurzer Local-Hänger und der naechste Cycle ging Cloud -> Quota.\nJetzt:\n* 3 lokale Versuche pro Write (mit progressivem Timeout 1x, 1.5x, 2x   + 200ms/500ms Pausen) bevor Cloud genutzt wird\n* Vorab-Check: ohne IP+Key+v3.3 wird der lokale Versuch komplett   uebersprungen (statt durch sendCommand-Timeout zu rennen)\n* v3.4-Devices loggen explizit 'not supported locally' - so sieht   man warum sie cloud-only sind\nNeuer Diagnose-Befehl:\n  iobroker sendto fid-smartlife.0 writeStats\nZeigt wie viele Devices zuletzt lokal vs cloud geschrieben wurden, plus Liste der Devices ohne IP (kein lokaler Pfad moeglich).",
         "en": "v0.7.7: Local write retries (3 attempts) before cloud fallback - fixes blink-script quota burn."
@@ -114,7 +118,7 @@
       "de": "Tuya / Smartlife Cloud-Adapter - Teil von Fiducerion Core."
     },
     "authors": [
-      "Bernd <noreply@example.com>"
+      "fiducerion"
     ],
     "keywords": [
       "tuya",
@@ -127,7 +131,7 @@
     "icon": "fid-smartlife.png",
     "enabled": true,
     "extIcon": "https://raw.githubusercontent.com/USER/iobroker.fid-smartlife/main/admin/fid-smartlife.png",
-    "readme": "https://github.com/USER/iobroker.fid-smartlife/blob/main/README.md",
+    "readme": "https://github.com/fiducerion/ioBroker.fid-smartlife/blob/main/README.md",
     "loglevel": "info",
     "mode": "daemon",
     "type": "iot-systems",
