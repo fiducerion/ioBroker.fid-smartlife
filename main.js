@@ -293,68 +293,37 @@ class FiducerionSmartlife extends utils.Adapter {
   }
 
   /**
-   * Loescht obsolete States aus alten Adapter-Versionen:
-   *  - <dev>._local.* (v0.3.x/v0.4.0 Channel - jetzt Top-Level)
-   *  - <dev>.<codeCanon> wo es ein <dev>.<dpsId> als Primary gibt
-   *    (z.B. <dev>.switch_1 wenn <dev>.1 jetzt der primary State ist)
-   * Aliase, _name, _noCloudStatusPoll, localXxx, ip, noLocalConnection,
-   * online und die DPS-ID-States bleiben.
+  /**
+   * Loescht obsolete States aus alten Adapter-Versionen.
+   *
+   * SAFE-MODE (v0.7.4): loescht NUR die alten _local.* Channels aus v0.3/0.4.
+   * Alles andere wird in Ruhe gelassen - damit verlieren wir keine Historie und
+   * keine fehlerhaft-aus-Cloud-gefilterten Devices.
+   *
+   * Frueher hat das auch andere "obsolete" Top-Level-States geloescht, aber
+   * das hat (a) bei jedem Start gefeuert (Markierungs-States waren nicht in
+   * keep_set, daher running ueber Tage Hunderte Operationen) und konnte (b)
+   * Devices entstellen wenn die Schema-Definition sich aenderte.
    */
   async _cleanupLegacyStates() {
     const all = await this.getAdapterObjectsAsync().catch(() => null);
     if (!all) return 0;
 
     let removed = 0;
-    const KEEP_TOP = new Set([
-      '_name', '_noCloudStatusPoll',
-      'ip', 'noLocalConnection', 'online',
-      'localKey', 'localVersion', 'localPort', 'localSource', 'localLastResult', 'localLastSeen'
-    ]);
-
     for (const [did, dev] of this.devices) {
       const prefix = this.namespace + '.' + did + '.';
-      // Welche Pfade sollen erhalten bleiben?
-      const keepSet = new Set();
-      // - Alle DPS-ID-Pfade  (+ enhanced derived + bitmap bits)
-      for (const c of dev.defCanonSet) {
-        const meta = dev.dpMeta[c];
-        const primary = (meta && meta.dpId && String(meta.dpId) !== c) ? String(meta.dpId) : c;
-        keepSet.add(primary);
-        // Enhanced derived states (z.B. '5-rgb', '24-rgb', 'phase_a-voltage')
-        const enh = enhanced.getEnhanced(meta && meta.dpId, c);
-        if (enh) {
-          for (const def of enh) keepSet.add(primary + def.postfix);
-        }
-        // Bitmap-bit states '110-0' bis '110-23'
-        if (meta && meta.isBitmap && Array.isArray(meta.bitmapLabels)) {
-          for (let i = 0; i < meta.bitmapLabels.length; i++) {
-            keepSet.add(primary + '-' + i);
-          }
-        }
-      }
-      // - Alle Aliase
-      for (const a of Object.keys(dev.alias || {})) {
-        if (!a.startsWith('_')) keepSet.add(a);
-      }
-      // - Top-Level-Always
-      for (const k of KEEP_TOP) keepSet.add(k);
-
       for (const fullId of Object.keys(all)) {
         if (!fullId.startsWith(prefix)) continue;
         const sub = fullId.slice(prefix.length);
         if (!sub) continue;
         const top = sub.split('.')[0];
-        // Alles unter _local.* wegloeschen (Channel + States)
+        // Nur ganz alte _local.* Channels aus v0.3/0.4 wegloeschen
         if (top === '_local') {
-          try { await this.delObjectAsync(fullId); removed++; } catch (e) {}
-          continue;
+          try {
+            await this.delObjectAsync(fullId);
+            removed++;
+          } catch (e) {}
         }
-        // Nur Top-Level betrachten - geschachtelte States gibt's bei uns sonst keine
-        if (sub !== top) continue;
-        if (keepSet.has(top)) continue;
-        // Sonst: obsolet
-        try { await this.delObjectAsync(fullId); removed++; }
-        catch (e) {}
       }
     }
     return removed;
@@ -1569,6 +1538,66 @@ class FiducerionSmartlife extends utils.Adapter {
         };
         if (obj.callback) {
           this.sendTo(obj.from, obj.command, stats, obj.callback);
+        }
+        return;
+      }
+      if (obj.command === 'listDevicesRaw') {
+        // Diagnose: was liefert Tuya direkt jetzt - hilft fehlende Devices zu finden
+        try {
+          const list = await this.cloud.listDevices();
+          const summary = list.map(d => ({
+            id: d.id,
+            name: d.name,
+            category: d.category,
+            online: !!d.online,
+            ip: d.ip || '',
+            local_key: d.local_key ? '(' + d.local_key.length + 'chars)' : '',
+            product_id: d.product_id || d.productKey || ''
+          }));
+          if (obj.callback) {
+            this.sendTo(obj.from, obj.command, { count: list.length, devices: summary }, obj.callback);
+          }
+        } catch (e) {
+          if (obj.callback) this.sendTo(obj.from, obj.command, { error: e.message }, obj.callback);
+        }
+        return;
+      }
+      if (obj.command === 'findMissingDevices') {
+        // Vergleicht Cloud-Liste mit Adapter-Objekten - listet die die mal da
+        // waren aber jetzt nicht mehr von Tuya geliefert werden
+        try {
+          const list = await this.cloud.listDevices();
+          const cloudIds = new Set(list.map(d => d.id));
+          const all = await this.getAdapterObjectsAsync().catch(() => null);
+          const localIds = new Set();
+          if (all) {
+            const prefix = this.namespace + '.';
+            for (const fullId of Object.keys(all)) {
+              if (!fullId.startsWith(prefix)) continue;
+              const obj = all[fullId];
+              if (obj.type !== 'device') continue;
+              const id = fullId.slice(prefix.length);
+              if (id && !id.startsWith('info')) localIds.add(id);
+            }
+          }
+          const missing = [];
+          for (const id of localIds) {
+            if (!cloudIds.has(id)) {
+              // War mal da, ist nicht mehr in Cloud
+              const nameObj = all[this.namespace + '.' + id];
+              missing.push({ id: id, name: (nameObj && nameObj.common && nameObj.common.name) || id });
+            }
+          }
+          const result = {
+            cloudCount: list.length,
+            localCount: localIds.size,
+            missingCount: missing.length,
+            missing: missing
+          };
+          this.log.info('findMissingDevices: ' + JSON.stringify(result));
+          if (obj.callback) this.sendTo(obj.from, obj.command, result, obj.callback);
+        } catch (e) {
+          if (obj.callback) this.sendTo(obj.from, obj.command, { error: e.message }, obj.callback);
         }
         return;
       }

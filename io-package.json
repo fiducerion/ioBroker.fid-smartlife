@@ -1,8 +1,12 @@
 {
   "common": {
     "name": "fid-smartlife",
-    "version": "0.7.3",
+    "version": "0.7.4",
     "news": {
+      "0.7.4": {
+        "de": "v0.7.4: Drei kritische Fixes.\n(1) Legacy-Cleanup im SAFE-MODE: loescht jetzt NUR die ganz alten _local.* Channels aus v0.3/0.4. Vorher hat er Top-Level-States als 'obsolet' geloescht die er nicht im keepSet hatte - das kann (a) fehlende Tuya-Cloud-Devices entstellen und (b) feuerte bei jedem Start ueber Hunderte Operationen.\n(2) Pulsar Reconnect-Loop gefixt: Bei jedem Reconnect war der alte MQTT-Client noch aktiv und sein close-Event triggerte sofort einen weiteren Reconnect. Jetzt: alter Client wird explizit vor Reconnect removed, plus _reconnectScheduled-Flag verhindert parallele Reconnects.\n(3) Neue Diagnose-Befehle:\n    iobroker sendto fid-smartlife.0 findMissingDevices\n    iobroker sendto fid-smartlife.0 listDevicesRaw\nPlus: Access-Config-Log zeigt jetzt alle Felder die Tuya zurueckgibt - damit sehen wir ob source_topic vielleicht falsch geparst wird oder andere Topics zur Verfuegung stehen.",
+        "en": "v0.7.4: Critical fixes - safe legacy cleanup, fixed pulsar reconnect loop, diagnostic commands."
+      },
       "0.7.3": {
         "de": "v0.7.3: Cloud-IP-Import + Pulsar-Raw-Counter.\n(1) Cloud-IP-Import: Per 'iobroker sendto fid-smartlife.0 importCloudIPs' kann man fuer alle Devices die noch keine .ip haben die IP per /v1.0/devices/{id} aus der Tuya-Cloud holen lassen. Rate-limit 800ms pro Call, Stop bei Cloud-Quota-Pause. Damit haben wir lokale IPs auch wenn LAN-Discovery die v3.3 Broadcasts nicht decrypten kann.\n(2) raw.ip aus listDevices Response wird jetzt als Fallback genutzt - manche Devices liefern die ip direkt mit beim Initial-Setup.\n(3) Pulsar: Neuer State info.pulsarRawRx zaehlt rohe MQTT-Messages (vor Parse/Decrypt). Damit sehen wir ob der Tuya-Broker uberhaupt etwas pusht - unabhaengig vom Decrypt-Erfolg. Plus Info-Log fuer jede rohe Message inkl. Topic und Groesse.",
         "en": "v0.7.3: Cloud-IP import + Pulsar raw message counter for diagnostics."
