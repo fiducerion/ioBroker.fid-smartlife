@@ -1,8 +1,12 @@
 {
   "common": {
     "name": "fid-smartlife",
-    "version": "0.7.0",
+    "version": "0.7.1",
     "news": {
+      "0.7.1": {
+        "de": "v0.7.1: Pulsar/MQTT API-Endpoint korrigiert. v0.7.0 nutzte den falschen Endpoint /v1.0/iot-03/open-hub/access-config (fuer IoT Industry Projects) - das gab 'permission deny code 1106'. Smart-Home Projects nutzen /v1.0/open-hub/access/config (ohne iot-03, Slash statt Bindestrich). Plus UID kommt jetzt aus der Token-Response (statt clientId als UID-Fake). Quelle: bestaetigt aus Home Assistant tuya-iot-py-sdk source und Tuya WebRTC-Dokumentation.",
+        "en": "v0.7.1: Fixed Pulsar/MQTT API endpoint - was using IoT Industry path causing 'permission deny code 1106' on Smart Home projects."
+      },
       "0.7.0": {
         "de": "v0.7.0: Tuya Pulsar/MQTT Push-Subscriber (experimentell). Empfaengt Device-Status-Updates per MQTT-Push statt durch Cloud-Polling. Massiv weniger API-Quota - speziell fuer Battery/Subdevices wichtig. Aktivierbar via Setting 'enablePulsar' (default off). Voraussetzung: In der Tuya IoT Platform unter dem Cloud-Project muss der Message Service abonniert sein (kostenlos in Trial-Edition). Implementation: Eigener minimaler MQTT 3.1.1 Client ueber Node's TLS (keine externe Dependency), AES-128-GCM + AES-128-ECB Decryption, Auth via /v1.0/iot-03/open-hub/access-config, Auto-Reconnect mit exponential backoff, Token-Refresh vor expire_time. Status-Updates werden direkt in die States gemirrort - es muss nicht mehr gepollt werden. Status sichtbar unter info.pulsarConnected/.pulsarMessages.",
         "en": "v0.7.0: Tuya Pulsar/MQTT push subscriber (experimental). Receives device status updates via MQTT push instead of cloud polling. Massive quota savings for battery/subdevices. Enable via 'enablePulsar' setting."

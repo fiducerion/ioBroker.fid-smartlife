@@ -753,6 +753,7 @@ class FiducerionSmartlife extends utils.Adapter {
       clientId:     this.config.clientId,
       clientSecret: secret,
       region:       this.config.region || 'eu',
+      cloudRef:     this.cloud,
       getCloudToken: async () => {
         if (this.cloud && typeof this.cloud.ensureToken === 'function') {
           return await this.cloud.ensureToken();
