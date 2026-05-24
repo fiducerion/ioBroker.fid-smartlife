@@ -1,8 +1,12 @@
 {
   "common": {
     "name": "fid-smartlife",
-    "version": "0.7.4",
+    "version": "0.7.5",
     "news": {
+      "0.7.5": {
+        "de": "v0.7.5: KRITISCHER FIX - LAN-Discovery Decrypt repariert.\nBug seit Anfang: Der UDP-Decrypt-Key fuer Tuya v3.3 Broadcasts war der String 'yGAdlopoPVldABfn' direkt - korrekt waere aber dessen MD5-Hash (16 Bytes Binary, anderer Wert). Damit scheiterte JEDER v3.3-Decrypt (decryptOk=0, decryptFail=7000+/min im Log).\nFolge: Keine Tuya-Devices mit v3.3 (= praktisch ALLE WiFi-Devices) bekamen eine local.ip. Alle Schreibvorgaenge gingen ueber Cloud - das hat bei Blink-Scripts (z.B. Alarm-Blinken alle 3s) die Tuya Cloud-Quota erschoepft.\nPlus: Frame-Parser sauber nach TuyAPI-Konvention. Prefix-/Suffix-Magic wird gecheckt. Optional '3.3'-Prefix vor Ciphertext wird erkannt und skipped (15 Byte). Headers 16 und 20 Offset werden probiert.\nWirkung: Devices kriegen wieder ihre IPs per LAN-Discovery. Writes gehen lokal. Cloud-Quota wird nicht mehr erschoepft.",
+        "en": "v0.7.5: CRITICAL FIX - LAN-Discovery decrypt was using wrong AES key (string vs MD5 hash)."
+      },
       "0.7.4": {
         "de": "v0.7.4: Drei kritische Fixes.\n(1) Legacy-Cleanup im SAFE-MODE: loescht jetzt NUR die ganz alten _local.* Channels aus v0.3/0.4. Vorher hat er Top-Level-States als 'obsolet' geloescht die er nicht im keepSet hatte - das kann (a) fehlende Tuya-Cloud-Devices entstellen und (b) feuerte bei jedem Start ueber Hunderte Operationen.\n(2) Pulsar Reconnect-Loop gefixt: Bei jedem Reconnect war der alte MQTT-Client noch aktiv und sein close-Event triggerte sofort einen weiteren Reconnect. Jetzt: alter Client wird explizit vor Reconnect removed, plus _reconnectScheduled-Flag verhindert parallele Reconnects.\n(3) Neue Diagnose-Befehle:\n    iobroker sendto fid-smartlife.0 findMissingDevices\n    iobroker sendto fid-smartlife.0 listDevicesRaw\nPlus: Access-Config-Log zeigt jetzt alle Felder die Tuya zurueckgibt - damit sehen wir ob source_topic vielleicht falsch geparst wird oder andere Topics zur Verfuegung stehen.",
         "en": "v0.7.4: Critical fixes - safe legacy cleanup, fixed pulsar reconnect loop, diagnostic commands."
