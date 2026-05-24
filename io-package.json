@@ -1,8 +1,12 @@
 {
   "common": {
     "name": "fid-smartlife",
-    "version": "0.7.2",
+    "version": "0.7.3",
     "news": {
+      "0.7.3": {
+        "de": "v0.7.3: Cloud-IP-Import + Pulsar-Raw-Counter.\n(1) Cloud-IP-Import: Per 'iobroker sendto fid-smartlife.0 importCloudIPs' kann man fuer alle Devices die noch keine .ip haben die IP per /v1.0/devices/{id} aus der Tuya-Cloud holen lassen. Rate-limit 800ms pro Call, Stop bei Cloud-Quota-Pause. Damit haben wir lokale IPs auch wenn LAN-Discovery die v3.3 Broadcasts nicht decrypten kann.\n(2) raw.ip aus listDevices Response wird jetzt als Fallback genutzt - manche Devices liefern die ip direkt mit beim Initial-Setup.\n(3) Pulsar: Neuer State info.pulsarRawRx zaehlt rohe MQTT-Messages (vor Parse/Decrypt). Damit sehen wir ob der Tuya-Broker uberhaupt etwas pusht - unabhaengig vom Decrypt-Erfolg. Plus Info-Log fuer jede rohe Message inkl. Topic und Groesse.",
+        "en": "v0.7.3: Cloud-IP import + Pulsar raw message counter for diagnostics."
+      },
       "0.7.2": {
         "de": "v0.7.2: Diagnose-Fix fuer LAN-Discovery + Pulsar/MQTT.\nLAN-Discovery: AES-Decrypt-Bug behoben - Tuya v3.3 Broadcasts haben 16 Byte Header (nicht 20 wie wir bisher gesetzt hatten). Wir probieren jetzt beide Offsets (16 und 20). Plus: Statistik-Counter, der alle 60 Sekunden loggt wie viele Pakete empfangen, decryptet und in Records umgewandelt wurden. Damit sehen wir endlich was Discovery wirklich macht.\nMQTT-Logging: CONNACK, SUBACK und SUBSCRIBE-Events laufen jetzt auf info-Level statt debug. Damit sehen wir ob Subscribe vom Tuya-Broker akzeptiert wurde (rc=0) oder rejected (rc=0x80) - das war bisher stillschweigend verloren gegangen.",
         "en": "v0.7.2: LAN-Discovery AES decrypt bug fixed (16-byte vs 20-byte header) plus diagnostic stats counters. MQTT events promoted to info-level for visibility."

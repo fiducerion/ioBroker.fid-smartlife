@@ -36,6 +36,7 @@ class FiducerionSmartlife extends utils.Adapter {
     this.on('ready',         this.onReady.bind(this));
     this.on('unload',        this.onUnload.bind(this));
     this.on('stateChange',   this.onStateChange.bind(this));
+    this.on('message',       this.onMessage.bind(this));
 
     /** @type {TuyaCloud|null} */
     this.cloud = null;
@@ -521,17 +522,24 @@ class FiducerionSmartlife extends utils.Adapter {
       const s = await this.getStateAsync(deviceId + '.' + k).catch(() => null);
       return (s && s.val !== undefined && s.val !== null && s.val !== '') ? s.val : fallback;
     };
-    const ip                = String(await v('ip', ''));
+    // raw.ip aus Cloud listDevices Response als Fallback - oft hat Tuya da
+    // schon die IP fuer online Devices.
+    const rawIp = (raw && (raw.ip || raw.local_ip || raw.device_ip)) || '';
+    const ip                = String(await v('ip', rawIp));
     const key               = String(await v('localKey', raw && raw.local_key || ''));
     const version           = String(await v('localVersion', '3.3'));
     const port              = Number(await v('localPort', tuyaLocal.DEFAULT_PORT));
-    // tuya-Konvention: noLocalConnection = "Local NICHT verwenden". Default ab v0.6.4
-    // ist FALSE - also lokal bevorzugen, wie tuya-Adapter es macht. Wenn das
-    // Gerät lokal nicht erreichbar ist (3x fail), wird der State automatisch
-    // auf true gesetzt und der Adapter faellt auf cloud-only zurueck.
     const noLocal           = !!(await v('noLocalConnection', false));
     const preferLocal       = !noLocal;
     const source            = String(await v('localSource', ''));
+
+    // Falls ip aus raw kam aber State noch leer ist: setzen
+    if (rawIp && tuyaLocal.isPrivateIp(rawIp)) {
+      const curIp = await this.getStateAsync(deviceId + '.ip').catch(() => null);
+      if (!curIp || !curIp.val) {
+        await this.setStateAsync(deviceId + '.ip', { val: rawIp, ack: true }).catch(() => {});
+      }
+    }
 
     return { ip, key, version, port, preferLocal, source };
   }
@@ -743,6 +751,11 @@ class FiducerionSmartlife extends utils.Adapter {
       common: { name: 'Pulsar empfangene Messages (Counter)', type: 'number', role: 'value', read: true, write: false, def: 0 },
       native: {}
     });
+    await this.setObjectNotExistsAsync('info.pulsarRawRx', {
+      type: 'state',
+      common: { name: 'Pulsar RAW MQTT Messages (vor Decrypt/Parse) - Diagnose', type: 'number', role: 'value', read: true, write: false, def: 0 },
+      native: {}
+    });
     await this.setObjectNotExistsAsync('info.pulsarLastMsg', {
       type: 'state',
       common: { name: 'Pulsar letzte Message Zeitstempel', type: 'string', role: 'value.time', read: true, write: false, def: '' },
@@ -772,6 +785,12 @@ class FiducerionSmartlife extends utils.Adapter {
     this.pulsar.on('message', (parsed) => this.onPulsarMessage(parsed).catch(e =>
       this.log.warn('Pulsar message handler: ' + (e.message || e))
     ));
+    this.pulsar.on('rawMessage', (topic, payload) => {
+      this.pulsarStats.rawRx = (this.pulsarStats.rawRx || 0) + 1;
+      this.setStateAsync('info.pulsarRawRx', { val: this.pulsarStats.rawRx, ack: true }).catch(() => {});
+      this.log.info('[pulsar] RAW Message empfangen #' + this.pulsarStats.rawRx
+        + ' topic=' + topic + ' size=' + payload.length + ' bytes (vor Parse/Decrypt)');
+    });
 
     await this.pulsar.start();
   }
@@ -1525,6 +1544,102 @@ class FiducerionSmartlife extends utils.Adapter {
     if (changed) {
       this.log.info('LAN-Discovery: ' + dev.name + ' -> ' + rec.ip + (rec.version ? ' v' + rec.version : ''));
     }
+  }
+
+  // -------------- Message-Handler (iobroker sendto) --------------
+
+  async onMessage(obj) {
+    if (!obj || !obj.command) return;
+    try {
+      if (obj.command === 'importCloudIPs') {
+        // Holt fuer alle Devices die noch keine ip haben die ip per
+        // /v1.0/devices/{id} aus der Tuya-Cloud. Rate-limited 1/Sek wegen Quota.
+        const max = (obj.message && obj.message.max) || 999;
+        const result = await this.importCloudIPs(max);
+        if (obj.callback) {
+          this.sendTo(obj.from, obj.command, result, obj.callback);
+        }
+        return;
+      }
+      if (obj.command === 'getStats') {
+        const stats = {
+          pulsar:    this.pulsarStats || {},
+          devices:   this.devices.size,
+          cloudQuotaPaused: !!(this._cloudQuotaPausedUntil && Date.now() < this._cloudQuotaPausedUntil)
+        };
+        if (obj.callback) {
+          this.sendTo(obj.from, obj.command, stats, obj.callback);
+        }
+        return;
+      }
+    } catch (e) {
+      this.log.warn('onMessage: ' + (e.message || e));
+      if (obj.callback) {
+        this.sendTo(obj.from, obj.command, { error: e.message }, obj.callback);
+      }
+    }
+  }
+
+  /**
+   * Holt fuer alle Devices die kein .ip haben die IP per Cloud-API.
+   * Achtung: Rate-limited (1 Call/Sek). Bei Cloud-Quota-Pause bricht ab.
+   * Setzt die IP in den .ip State plus dev.local.ip.
+   */
+  async importCloudIPs(maxDevices) {
+    if (!this.cloud) return { error: 'cloud not ready' };
+    if (this._cloudQuotaPausedUntil && Date.now() < this._cloudQuotaPausedUntil) {
+      return { error: 'cloud quota paused', skipped: true };
+    }
+    let ok = 0, fail = 0, alreadySet = 0, withIp = 0, noIp = 0;
+    const limit = Math.min(maxDevices || 999, 999);
+    const candidates = [];
+    for (const [id, dev] of this.devices) {
+      if (dev.local && dev.local.ip) { alreadySet++; continue; }
+      candidates.push([id, dev]);
+    }
+    this.log.info('importCloudIPs: starte Cloud-IP-Lookup fuer ' + Math.min(candidates.length, limit) + ' Devices (von ' + candidates.length + ' ohne IP) ...');
+
+    let processed = 0;
+    for (const [id, dev] of candidates) {
+      if (processed >= limit) break;
+      // Quota check
+      if (this._cloudQuotaPausedUntil && Date.now() < this._cloudQuotaPausedUntil) {
+        this.log.warn('importCloudIPs: Cloud-Quota erschoepft - Abbruch nach ' + processed);
+        break;
+      }
+      processed++;
+      try {
+        const info = await this.cloud.getDeviceInfo(id);
+        if (!info) { fail++; continue; }
+        const ip = info.ip || info.local_ip || '';
+        if (ip && tuyaLocal.isPrivateIp(ip)) {
+          dev.local.ip = ip;
+          await this.setStateAsync(id + '.ip', { val: ip, ack: true });
+          await this.setStateAsync(id + '.localSource', { val: 'cloud-import', ack: true });
+          ok++;
+          withIp++;
+          this.log.debug('importCloudIPs: ' + dev.name + ' -> ' + ip);
+        } else {
+          noIp++;
+          this.log.debug('importCloudIPs: ' + dev.name + ' (' + id + ') keine ip in Cloud-Response');
+        }
+      } catch (e) {
+        fail++;
+        const msg = String(e && e.message || e).toLowerCase();
+        if (msg.includes('quota') || msg.includes('exceeded') || msg.includes('rate limit')) {
+          this._cloudQuotaPausedUntil = Date.now() + 60 * 60 * 1000;
+          await this.setStateAsync('info.cloudQuotaPaused', { val: true, ack: true }).catch(() => {});
+          this.log.warn('importCloudIPs: Cloud-Quota erschoepft, pausiere 60min - Abbruch nach ' + processed);
+          break;
+        }
+        this.log.debug('importCloudIPs: ' + id + ' fail: ' + e.message);
+      }
+      // Rate-limit: 800ms pro Call
+      await new Promise(r => setTimeout(r, 800));
+    }
+    const result = { ok, fail, alreadySet, withIp, noIp, processed, total: this.devices.size };
+    this.log.info('importCloudIPs: fertig - ' + JSON.stringify(result));
+    return result;
   }
 
   // -------------- Import lokaler IPs aus iobroker.tuya --------------
