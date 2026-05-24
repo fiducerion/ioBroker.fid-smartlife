@@ -382,8 +382,12 @@ class FiducerionSmartlife extends utils.Adapter {
       name: 'Name', type: 'string', role: 'text', read: true, write: false
     });
     await this.ensureState(id + '.online', {
-      name: name + ' - Cloud Online', type: 'boolean',
-      role: 'indicator.reachable', read: true, write: false
+      type: 'boolean',
+      role: 'indicator.reachable',
+      read: true,
+      write: false,
+      def: false,
+      desc: 'Geraet ist lokal erreichbar (mit Hysterese)'
     });
     await this.ensureState(id + '._noCloudStatusPoll', {
       name: 'Disable regular cloud status polling',
@@ -391,9 +395,8 @@ class FiducerionSmartlife extends utils.Adapter {
     });
 
     await this.setStateAsync(id + '._name', { val: name, ack: true });
-    if (typeof raw.online !== 'undefined') {
-      await this.setStateAsync(id + '.online', { val: !!raw.online, ack: true });
-    }
+    // online wird NICHT mehr aus raw.online (Cloud-Online) gesetzt - das passiert
+    // jetzt im pollAll basierend auf lokaler Erreichbarkeit mit Hysterese.
 
     // Default-Wert fuer _noCloudStatusPoll setzen falls in der noPoll-Liste
     if (this.noPollSet.has(id)) {
@@ -910,6 +913,7 @@ class FiducerionSmartlife extends utils.Adapter {
           await this.mirrorStatusDps(dev, res.dps);
           localOk = true;
           dev._localFailCount = 0;   // reset
+          dev._lastLocalOk = now;    // timestamp fuer Hysterese
           // online=true setzen weil lokal erreichbar
           await this.setStateAsync(id + '.online',           { val: true, ack: true }).catch(() => {});
           await this.setStateAsync(id + '.noLocalConnection',{ val: false, ack: true }).catch(() => {});
@@ -920,11 +924,23 @@ class FiducerionSmartlife extends utils.Adapter {
           dev._localFailCount = (dev._localFailCount || 0) + 1;
           await this.setStateAsync(id + '.localLastResult',  { val: 'queryStatus fail: ' + (res && res.reason || 'unknown'), ack: true }).catch(() => {});
           this.log.debug('Local queryStatus ' + dev.name + ' fail #' + dev._localFailCount + ': ' + (res && res.reason));
-          // Smarter Auto-Failover v0.6.5:
-          // 3x in Folge fail -> TEMPORAER 5min cloud, danach wieder lokal probieren.
-          // Max 3 Failover-Zyklen pro Stunde, danach bleibts cloud bis Adapter-Restart.
-          // Vorteil: bei kurzem Netzaussetzer schaltet sich Local automatisch wieder ein
-          // ohne dass die Tuya-Cloud-Quota erschoepft wird.
+
+          // Online-Hysterese: erst auf false setzen wenn (50+ Fails in Folge)
+          // ODER (60 Min ohne lokal-OK). Damit togglen wir nicht bei WLAN-Zickigkeit.
+          const lastOk = dev._lastLocalOk || 0;
+          const hourWithoutOk = (now - lastOk) > 60 * 60 * 1000;
+          const manyFails = dev._localFailCount >= 50;
+          if (manyFails || hourWithoutOk) {
+            // Nur 1x umschalten - vermeidet redundante State-Updates
+            const onlineState = await this.getStateAsync(id + '.online').catch(() => null);
+            if (onlineState && onlineState.val === true) {
+              await this.setStateAsync(id + '.online', { val: false, ack: true }).catch(() => {});
+              this.log.debug('Online-Hysterese: ' + dev.name + ' -> offline (' +
+                (manyFails ? 'fails=' + dev._localFailCount : '>1h ohne OK') + ')');
+            }
+          }
+
+          // Smarter Auto-Failover v0.6.5: 3x in Folge fail -> TEMPORAER 5min cloud
           if (dev._localFailCount >= 3) {
             const hour = Math.floor(now / 3600000);
             if (dev._failoverHour !== hour) {
@@ -932,15 +948,14 @@ class FiducerionSmartlife extends utils.Adapter {
               dev._failoverHourCount = 0;
             }
             dev._failoverHourCount = (dev._failoverHourCount || 0) + 1;
-            dev._localFailCount = 0;   // counter reset, next try wieder von 0
+            // Counter NICHT mehr resetten - wir wollen ja den >=50 Schwellenwert
+            // fuer die Online-Hysterese behalten. Failover bleibt unabhaengig.
 
             if (dev._failoverHourCount > 3) {
-              // 3 Failover-Zyklen in dieser Stunde - jetzt erst PERMANENT auf cloud-only
               await this.setStateAsync(id + '.noLocalConnection', { val: true, ack: true }).catch(() => {});
               dev.local.preferLocal = false;
               this.log.info('Auto-Failover (permanent): ' + dev.name + ' (' + id + ') 3x Failover in 1h - cloud-only');
             } else {
-              // Temporaer 5min auf cloud, dann auto-retry lokal
               dev._cloudOnlyUntil = now + 5 * 60 * 1000;
               this.log.debug('Auto-Failover (temp 5min): ' + dev.name + ' - lokal mehrfach gescheitert');
             }
@@ -962,8 +977,11 @@ class FiducerionSmartlife extends utils.Adapter {
       try {
         const status = await this.cloud.getStatus(id);
         await this.mirrorStatus(dev, status);
-        if (typeof dev.raw.online !== 'undefined') {
-          await this.setStateAsync(id + '.online', { val: !!dev.raw.online, ack: true });
+        // online: nur fuer Battery/Sub-Devices (kein lokaler Pfad moeglich) aus Cloud.
+        // Bei normalen WiFi-Devices wird .online im lokalen Pfad gesetzt (Hysterese).
+        const hasLocalCapability = !!(localCfg.ip && localCfg.key && version === '3.3');
+        if (!hasLocalCapability && typeof dev.raw.online !== 'undefined') {
+          await this.setStateAsync(id + '.online', { val: !!dev.raw.online, ack: true }).catch(() => {});
         }
       } catch (e) {
         const msg = String(e && e.message || e).toLowerCase();

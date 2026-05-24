@@ -1,8 +1,12 @@
 {
   "common": {
     "name": "fid-smartlife",
-    "version": "0.7.5",
+    "version": "0.7.6",
     "news": {
+      "0.7.6": {
+        "de": "v0.7.6: Online-State mit Hysterese aus lokaler Erreichbarkeit.\nVorher: .online kam aus raw.online der Tuya-Cloud - Battery-Devices (Temperatur, Magnet, Rauchmelder) waren so permanent 'offline' obwohl sie funktionieren. Plus: bei WLAN-Zickern flippte der Online-State sofort.\nJetzt:\n* WiFi-Devices mit ip+localKey: .online = true bei lokalem queryStatus   Erfolg. Wechsel auf false nur mit Hysterese: 50 Fails in Folge ODER   60 Min ohne lokalen Erfolg.\n* Battery/Sub-Devices ohne lokale Capability: weiterhin .online aus   Cloud (raw.online), da kein lokaler Poll-Pfad existiert.\n* Pulsar-Events (bizCode online/offline) bleiben authoritativ wenn   sie kommen.\nDamit togglet .online nicht mehr und entspricht der tatsaechlichen Erreichbarkeit.",
+        "en": "v0.7.6: Online state with hysteresis (50 fails or 60min without OK) based on local reachability, not cloud status."
+      },
       "0.7.5": {
         "de": "v0.7.5: KRITISCHER FIX - LAN-Discovery Decrypt repariert.\nBug seit Anfang: Der UDP-Decrypt-Key fuer Tuya v3.3 Broadcasts war der String 'yGAdlopoPVldABfn' direkt - korrekt waere aber dessen MD5-Hash (16 Bytes Binary, anderer Wert). Damit scheiterte JEDER v3.3-Decrypt (decryptOk=0, decryptFail=7000+/min im Log).\nFolge: Keine Tuya-Devices mit v3.3 (= praktisch ALLE WiFi-Devices) bekamen eine local.ip. Alle Schreibvorgaenge gingen ueber Cloud - das hat bei Blink-Scripts (z.B. Alarm-Blinken alle 3s) die Tuya Cloud-Quota erschoepft.\nPlus: Frame-Parser sauber nach TuyAPI-Konvention. Prefix-/Suffix-Magic wird gecheckt. Optional '3.3'-Prefix vor Ciphertext wird erkannt und skipped (15 Byte). Headers 16 und 20 Offset werden probiert.\nWirkung: Devices kriegen wieder ihre IPs per LAN-Discovery. Writes gehen lokal. Cloud-Quota wird nicht mehr erschoepft.",
         "en": "v0.7.5: CRITICAL FIX - LAN-Discovery decrypt was using wrong AES key (string vs MD5 hash)."
