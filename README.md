@@ -1,3 +1,5 @@
+<img src="admin/fid-smartlife.png" alt="logo" width="120" align="right"/>
+
 # ioBroker.fid-smartlife
 
 Tuya / Smart Life cloud + local LAN adapter for ioBroker.
