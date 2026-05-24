@@ -1423,7 +1423,11 @@ class FiducerionSmartlife extends utils.Adapter {
     // Frische Local-Settings aus States lesen (User kann sie live aendern)
     dev.local = await this.readLocalStates(dev.id, dev.raw);
 
-    if (dev.local.preferLocal) {
+    // Vorab-Check: ohne IP+key+v3.3 hat lokaler Versuch keine Chance.
+    // Damit sparen wir den Timeout-Roundtrip + sofort-Cloud-Fallback.
+    const canLocal = !!(dev.local.preferLocal && dev.local.ip && dev.local.key && dev.local.version === '3.3');
+
+    if (canLocal) {
       // dpsMap: dpId-String -> value
       const dpsMap = {};
       let allDpsKnown = true;
@@ -1437,19 +1441,48 @@ class FiducerionSmartlife extends utils.Adapter {
         await this.setStateAsync(dev.id + '.localLastResult', { val: 'local skipped: no dpId mapping', ack: true });
         // Fallthrough auf Cloud
       } else {
-        const r = await tuyaLocal.sendCommand({
-          ip:        dev.local.ip,
-          localKey:  dev.local.key,
-          deviceId:  dev.id,
-          dpsMap:    dpsMap,
-          version:   dev.local.version,
-          port:      dev.local.port,
-          timeoutMs: Number(this.config.localTimeoutMs) || 2500
-        });
-        await this.setStateAsync(dev.id + '.localLastResult', { val: 'local ' + r.reason, ack: true });
-        if (r.ok) return;   // Erfolg - kein Cloud-Versuch
-        this.log.debug('Local failed for ' + dev.name + ': ' + r.reason + ' - falling back to cloud');
+        // 3 lokale Versuche bevor wir Cloud nehmen. Erste Versuch mit normalem
+        // Timeout. Wenn 1. fail: 200ms warten, dann nochmal mit 1.5x Timeout.
+        // Wenn 2. fail: 500ms warten, 2x Timeout. Erst dann Cloud.
+        // Bei Blink-Scripts (alle 3s) haben wir so 3 Chancen pro Schaltakt.
+        const baseTimeout = Number(this.config.localTimeoutMs) || 2500;
+        const tries = [
+          { delayBeforeMs: 0,   timeoutMs: baseTimeout },
+          { delayBeforeMs: 200, timeoutMs: Math.round(baseTimeout * 1.5) },
+          { delayBeforeMs: 500, timeoutMs: baseTimeout * 2 }
+        ];
+        let lastReason = 'unknown';
+        for (let i = 0; i < tries.length; i++) {
+          const t = tries[i];
+          if (t.delayBeforeMs > 0) {
+            await new Promise(r => setTimeout(r, t.delayBeforeMs));
+          }
+          const r = await tuyaLocal.sendCommand({
+            ip:        dev.local.ip,
+            localKey:  dev.local.key,
+            deviceId:  dev.id,
+            dpsMap:    dpsMap,
+            version:   dev.local.version,
+            port:      dev.local.port,
+            timeoutMs: t.timeoutMs
+          });
+          if (r.ok) {
+            const note = (i === 0) ? 'local ok' : ('local ok (retry ' + i + ')');
+            await this.setStateAsync(dev.id + '.localLastResult', { val: note, ack: true });
+            if (i > 0) this.log.debug('Local write ' + dev.name + ' OK at retry ' + i);
+            return;   // Erfolg - kein Cloud-Versuch
+          }
+          lastReason = r.reason;
+        }
+        await this.setStateAsync(dev.id + '.localLastResult', { val: 'local fail after 3 tries: ' + lastReason, ack: true });
+        this.log.debug('Local failed for ' + dev.name + ' after 3 tries (' + lastReason + ') - falling back to cloud');
       }
+    } else if (dev.local.preferLocal && !dev.local.ip) {
+      // IP fehlt komplett - kein lokaler Versuch, aber wir warnen damit man's sieht
+      await this.setStateAsync(dev.id + '.localLastResult', { val: 'no local ip - direct cloud', ack: true });
+    } else if (dev.local.preferLocal && dev.local.version !== '3.3') {
+      // v3.4 etc - aktuell kein lokaler Support, direkt Cloud
+      await this.setStateAsync(dev.id + '.localLastResult', { val: 'version ' + dev.local.version + ' not supported locally - direct cloud', ack: true });
     }
 
     // Cloud-Pfad: mit Quota-Guard + globalem Throttle (v0.6.5)
@@ -1546,6 +1579,28 @@ class FiducerionSmartlife extends utils.Adapter {
         if (obj.callback) {
           this.sendTo(obj.from, obj.command, result, obj.callback);
         }
+        return;
+      }
+      if (obj.command === 'writeStats') {
+        // Statistik wo Writes hingegangen sind in letzter Zeit
+        let local = 0, cloud = 0, fail = 0, noIp = 0;
+        const noIpDevices = [];
+        for (const [id, dev] of this.devices) {
+          if (!dev.local) continue;
+          const lr = await this.getStateAsync(id + '.localLastResult').catch(() => null);
+          if (!lr || !lr.val) continue;
+          const v = String(lr.val).toLowerCase();
+          if (v.startsWith('local ok')) local++;
+          else if (v.includes('cloud')) cloud++;
+          else if (v.includes('no local ip')) { noIp++; noIpDevices.push(dev.name || id); }
+          else if (v.includes('fail')) fail++;
+        }
+        const result = {
+          local, cloud, fail, noIp,
+          noIpDevices: noIpDevices.slice(0, 20),  // begrenzen damit der output nicht uebergeht
+          totalDevices: this.devices.size
+        };
+        if (obj.callback) this.sendTo(obj.from, obj.command, result, obj.callback);
         return;
       }
       if (obj.command === 'getStats') {

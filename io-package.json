@@ -1,8 +1,12 @@
 {
   "common": {
     "name": "fid-smartlife",
-    "version": "0.7.6",
+    "version": "0.7.7",
     "news": {
+      "0.7.7": {
+        "de": "v0.7.7: Write-Pfad mit Retries gegen Cloud-Quota-Wand.\nVorher: 1 lokaler Schreibversuch -> sofort Cloud-Fallback. Bei Blink-Scripts (3s-Takt) reichte ein kurzer Local-Hänger und der naechste Cycle ging Cloud -> Quota.\nJetzt:\n* 3 lokale Versuche pro Write (mit progressivem Timeout 1x, 1.5x, 2x   + 200ms/500ms Pausen) bevor Cloud genutzt wird\n* Vorab-Check: ohne IP+Key+v3.3 wird der lokale Versuch komplett   uebersprungen (statt durch sendCommand-Timeout zu rennen)\n* v3.4-Devices loggen explizit 'not supported locally' - so sieht   man warum sie cloud-only sind\nNeuer Diagnose-Befehl:\n  iobroker sendto fid-smartlife.0 writeStats\nZeigt wie viele Devices zuletzt lokal vs cloud geschrieben wurden, plus Liste der Devices ohne IP (kein lokaler Pfad moeglich).",
+        "en": "v0.7.7: Local write retries (3 attempts) before cloud fallback - fixes blink-script quota burn."
+      },
       "0.7.6": {
         "de": "v0.7.6: Online-State mit Hysterese aus lokaler Erreichbarkeit.\nVorher: .online kam aus raw.online der Tuya-Cloud - Battery-Devices (Temperatur, Magnet, Rauchmelder) waren so permanent 'offline' obwohl sie funktionieren. Plus: bei WLAN-Zickern flippte der Online-State sofort.\nJetzt:\n* WiFi-Devices mit ip+localKey: .online = true bei lokalem queryStatus   Erfolg. Wechsel auf false nur mit Hysterese: 50 Fails in Folge ODER   60 Min ohne lokalen Erfolg.\n* Battery/Sub-Devices ohne lokale Capability: weiterhin .online aus   Cloud (raw.online), da kein lokaler Poll-Pfad existiert.\n* Pulsar-Events (bizCode online/offline) bleiben authoritativ wenn   sie kommen.\nDamit togglet .online nicht mehr und entspricht der tatsaechlichen Erreichbarkeit.",
         "en": "v0.7.6: Online state with hysteresis (50 fails or 60min without OK) based on local reachability, not cloud status."
