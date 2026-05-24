@@ -1,8 +1,12 @@
 {
   "common": {
     "name": "fid-smartlife",
-    "version": "0.7.1",
+    "version": "0.7.2",
     "news": {
+      "0.7.2": {
+        "de": "v0.7.2: Diagnose-Fix fuer LAN-Discovery + Pulsar/MQTT.\nLAN-Discovery: AES-Decrypt-Bug behoben - Tuya v3.3 Broadcasts haben 16 Byte Header (nicht 20 wie wir bisher gesetzt hatten). Wir probieren jetzt beide Offsets (16 und 20). Plus: Statistik-Counter, der alle 60 Sekunden loggt wie viele Pakete empfangen, decryptet und in Records umgewandelt wurden. Damit sehen wir endlich was Discovery wirklich macht.\nMQTT-Logging: CONNACK, SUBACK und SUBSCRIBE-Events laufen jetzt auf info-Level statt debug. Damit sehen wir ob Subscribe vom Tuya-Broker akzeptiert wurde (rc=0) oder rejected (rc=0x80) - das war bisher stillschweigend verloren gegangen.",
+        "en": "v0.7.2: LAN-Discovery AES decrypt bug fixed (16-byte vs 20-byte header) plus diagnostic stats counters. MQTT events promoted to info-level for visibility."
+      },
       "0.7.1": {
         "de": "v0.7.1: Pulsar/MQTT API-Endpoint korrigiert. v0.7.0 nutzte den falschen Endpoint /v1.0/iot-03/open-hub/access-config (fuer IoT Industry Projects) - das gab 'permission deny code 1106'. Smart-Home Projects nutzen /v1.0/open-hub/access/config (ohne iot-03, Slash statt Bindestrich). Plus UID kommt jetzt aus der Token-Response (statt clientId als UID-Fake). Quelle: bestaetigt aus Home Assistant tuya-iot-py-sdk source und Tuya WebRTC-Dokumentation.",
         "en": "v0.7.1: Fixed Pulsar/MQTT API endpoint - was using IoT Industry path causing 'permission deny code 1106' on Smart Home projects."
