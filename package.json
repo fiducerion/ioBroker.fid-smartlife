@@ -1,10 +1,10 @@
 {
   "name": "iobroker.fid-smartlife",
-  "version": "0.7.9",
+  "version": "0.10.8",
   "description": "Fiducerion Smartlife - Tuya Cloud Adapter (Teil von Fiducerion Core)",
   "author": {
     "name": "fiducerion",
-    "email": "noreply@example.com"
+    "email": "info@fiducerion.com"
   },
   "homepage": "https://github.com/fiducerion/ioBroker.fid-smartlife",
   "license": "MIT",
@@ -19,7 +19,9 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@iobroker/adapter-core": "^3.2.3"
+    "@iobroker/adapter-core": "^3.2.3",
+    "@tuyapi/cloud": "^0.6.2",
+    "tuyapi": "^7.5.2"
   },
   "repository": {
     "type": "git",
@@ -27,5 +29,16 @@
   },
   "bugs": {
     "url": "https://github.com/fiducerion/ioBroker.fid-smartlife/issues"
+  },
+  "files": [
+    "admin/",
+    "lib/",
+    "main.js",
+    "io-package.json",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "echo \"no tests yet\" && exit 0"
   }
 }

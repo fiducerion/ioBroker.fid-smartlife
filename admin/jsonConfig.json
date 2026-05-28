@@ -12,32 +12,51 @@
       "newLine": true,
       "type": "staticText",
       "text": "Lege dir auf iot.tuya.com einen Cloud-Project an, linke deine SmartLife-App und kopiere Access ID / Access Secret hierher. Die Region muss zu deinem App-Account passen.",
-      "style": { "fontStyle": "italic", "marginBottom": "12px", "color": "#666" }
+      "style": {
+        "fontStyle": "italic",
+        "marginBottom": "12px",
+        "color": "#666"
+      }
     },
     "clientId": {
       "newLine": true,
       "type": "text",
       "label": "Access ID (Client ID)",
       "help": "Dein Tuya Cloud Access ID",
-      "sm": 12, "md": 6
+      "sm": 12,
+      "md": 6
     },
     "clientSecret": {
       "type": "password",
       "label": "Access Secret (Client Secret)",
       "help": "Dein Tuya Cloud Access Secret",
-      "sm": 12, "md": 6
+      "sm": 12,
+      "md": 6
     },
     "region": {
       "newLine": true,
       "type": "select",
       "label": "Region",
       "options": [
-        { "value": "eu", "label": "Europe (openapi.tuyaeu.com)" },
-        { "value": "us", "label": "America (openapi.tuyaus.com)" },
-        { "value": "cn", "label": "China (openapi.tuyacn.com)" },
-        { "value": "in", "label": "India (openapi.tuyain.com)" }
+        {
+          "value": "eu",
+          "label": "Europe (openapi.tuyaeu.com)"
+        },
+        {
+          "value": "us",
+          "label": "America (openapi.tuyaus.com)"
+        },
+        {
+          "value": "cn",
+          "label": "China (openapi.tuyacn.com)"
+        },
+        {
+          "value": "in",
+          "label": "India (openapi.tuyain.com)"
+        }
       ],
-      "sm": 12, "md": 4
+      "sm": 12,
+      "md": 4
     },
     "_header_poll": {
       "newLine": true,
@@ -52,7 +71,8 @@
       "max": 3600,
       "label": "Poll-Intervall (Sekunden)",
       "help": "Wie oft Geraetestatus aus der Cloud abgerufen wird. Default 60.",
-      "sm": 12, "md": 3
+      "sm": 12,
+      "md": 3
     },
     "rediscoverIntervalMin": {
       "type": "number",
@@ -60,7 +80,8 @@
       "max": 10080,
       "label": "Rediscovery (Minuten)",
       "help": "0 = keine periodische Rediscovery. Default 720 (alle 12 Stunden).",
-      "sm": 12, "md": 3
+      "sm": 12,
+      "md": 3
     },
     "maxParallelPolls": {
       "type": "number",
@@ -68,7 +89,8 @@
       "max": 5,
       "label": "Parallele Polls",
       "help": "Wie viele Geraete gleichzeitig gepollt werden. Default 1 (sequentiell, schonend).",
-      "sm": 12, "md": 3
+      "sm": 12,
+      "md": 3
     },
     "requestTimeoutMs": {
       "type": "number",
@@ -76,7 +98,8 @@
       "max": 60000,
       "label": "Request-Timeout (ms)",
       "help": "HTTP-Timeout fuer einzelne Cloud-Aufrufe. Default 12000.",
-      "sm": 12, "md": 3
+      "sm": 12,
+      "md": 3
     },
     "_header_write": {
       "newLine": true,
@@ -91,13 +114,15 @@
       "max": 5000,
       "label": "Write-Debounce (ms)",
       "help": "Zusammenfassen schnell aufeinanderfolgender Writes. Default 400.",
-      "sm": 12, "md": 4
+      "sm": 12,
+      "md": 4
     },
     "optimisticAck": {
       "type": "checkbox",
       "label": "Optimistic ACK",
       "help": "Beim Schreiben den State sofort mit ack=true zurueckschreiben, bevor das Geraet bestaetigt. Schnelle UI-Reaktion. Default an.",
-      "sm": 12, "md": 4
+      "sm": 12,
+      "md": 4
     },
     "_header_quirks": {
       "newLine": true,
@@ -110,7 +135,8 @@
       "type": "text",
       "label": "Geraete-IDs ohne Cloud-Status-Poll",
       "help": "Komma-getrennte Liste von deviceIds die NICHT regelmaessig per Cloud gepollt werden sollen (z.B. weil sie 'function not support' werfen). Default enthaelt zwei bekannte Problemgeraete.",
-      "sm": 12, "md": 12,
+      "sm": 12,
+      "md": 12,
       "noTranslation": true
     },
     "_header_local": {
@@ -123,20 +149,26 @@
       "newLine": true,
       "type": "staticText",
       "text": "Pro Geraet kann via fid-smartlife.0.<deviceId>._local.preferLocal=true aktiviert werden, dass Schreibbefehle ueber LAN statt Cloud gehen. localKey wird aus der Cloud-Discovery uebernommen. IP+Version koennen aus tuya.0 importiert werden, falls dieser Adapter noch parallel laeuft, oder per UDP-Broadcast erkannt werden.",
-      "style": { "fontStyle": "italic", "marginBottom": "12px", "color": "#666" }
+      "style": {
+        "fontStyle": "italic",
+        "marginBottom": "12px",
+        "color": "#666"
+      }
     },
     "enableLanDiscovery": {
       "newLine": true,
       "type": "checkbox",
       "label": "LAN-Discovery aktivieren (UDP 6666/6667/7000)",
       "help": "Lauscht auf Tuya-Geraete-Broadcasts und uebernimmt IP+Version automatisch in die _local-States.",
-      "sm": 12, "md": 6
+      "sm": 12,
+      "md": 6
     },
     "importLocalFromTuyaAdapter": {
       "type": "checkbox",
       "label": "Import lokaler IPs aus tuya.0",
       "help": "Falls iobroker.tuya parallel laeuft, werden lokale IPs/Versionen beim Start uebernommen.",
-      "sm": 12, "md": 6
+      "sm": 12,
+      "md": 6
     },
     "_header_pulsar": {
       "newLine": true,
@@ -148,14 +180,19 @@
       "newLine": true,
       "type": "staticText",
       "text": "Wenn aktiviert, verbindet sich der Adapter via MQTT mit dem Tuya-Pulsar-Broker und empfaengt Device-Status-Updates per Push (statt per Polling). Voraussetzung: In der Tuya IoT Platform muss unter dem Cloud-Project der Message Service abonniert sein. Spart massiv Cloud-Quota - besonders fuer Battery-/Subdevices wichtig.",
-      "style": { "fontStyle": "italic", "marginBottom": "12px", "color": "#666" }
+      "style": {
+        "fontStyle": "italic",
+        "marginBottom": "12px",
+        "color": "#666"
+      }
     },
     "enablePulsar": {
       "newLine": true,
       "type": "checkbox",
       "label": "Pulsar/MQTT Push aktivieren",
       "help": "Voraussetzung: Message Service in Tuya IoT Platform abonniert. Status sichtbar unter info.pulsarConnected.",
-      "sm": 12, "md": 6
+      "sm": 12,
+      "md": 6
     },
     "localTimeoutMs": {
       "newLine": true,
@@ -164,7 +201,106 @@
       "max": 30000,
       "label": "Lokales Timeout (ms)",
       "help": "TCP-Timeout fuer Local-Schreibbefehle. Default 2500.",
-      "sm": 12, "md": 3
+      "sm": 12,
+      "md": 3
+    },
+    "_header_appcloud": {
+      "newLine": true,
+      "type": "header",
+      "size": 3,
+      "text": "Tuya App-Cloud (Smart-Life Email-Login) - v0.8.6"
+    },
+    "_info_appcloud": {
+      "newLine": true,
+      "type": "staticText",
+      "text": "Login mit Smart-Life-App Email/Passwort als zusaetzliche Datenquelle. Hauptzweck: Online-Check vor Cloud-Write damit wir keine Cloud-Quota fuer offline Devices verschwenden. Aktivieren mit appCloudEnabled=true. Hinweis: beim ersten Login bekommt die Smart Life App eine Notification (\"neues Geraet angemeldet\"). Spaeter nicht mehr (Session bleibt 29 Tage gueltig).",
+      "style": {
+        "fontStyle": "italic",
+        "marginBottom": "12px",
+        "color": "#666"
+      }
+    },
+    "appCloudEnabled": {
+      "newLine": true,
+      "type": "checkbox",
+      "label": "App-Cloud aktivieren (Online-Check + Refresh-Loop)",
+      "help": "Wenn aktiv: Online-Status wird alle X Sek aus App-Cloud aktualisiert. Cloud-Writes auf offline Devices werden geskippt.",
+      "sm": 12
+    },
+    "appCloudEmail": {
+      "newLine": true,
+      "type": "text",
+      "label": "Smart-Life Email",
+      "help": "Email vom Smart-Life App Account",
+      "sm": 12,
+      "md": 6
+    },
+    "appCloudPassword": {
+      "type": "password",
+      "label": "Smart-Life Passwort",
+      "help": "Passwort vom Smart-Life App Account",
+      "sm": 12,
+      "md": 6
+    },
+    "appCloudRegion": {
+      "newLine": true,
+      "type": "select",
+      "label": "Region",
+      "options": [
+        {
+          "label": "EU",
+          "value": "EU"
+        },
+        {
+          "label": "US",
+          "value": "US"
+        },
+        {
+          "label": "CN",
+          "value": "CN"
+        },
+        {
+          "label": "IN",
+          "value": "IN"
+        }
+      ],
+      "sm": 12,
+      "md": 4
+    },
+    "appCloudRefreshSec": {
+      "type": "number",
+      "label": "Refresh-Intervall (s)",
+      "help": "Wie oft App-Cloud aktualisiert (default 300s = 5min)",
+      "min": 60,
+      "max": 3600,
+      "sm": 12,
+      "md": 4
+    },
+    "cloudPollMode": {
+      "newLine": true,
+      "type": "select",
+      "label": "Cloud-Poll-Mode",
+      "help": "auto = App-Cloud reicht (keine Cloud-Polls wenn online). hybrid = App-Cloud + 1x/h Cloud-Cross-Check. cloud-only = nur klassisches Cloud-Polling. app-only = nur App-Cloud, nie Cloud.",
+      "options": [
+        {
+          "label": "auto - kein Cloud-Poll wenn App-Cloud aktiv (default)",
+          "value": "auto"
+        },
+        {
+          "label": "hybrid - 1x/h Cloud-Cross-Check",
+          "value": "hybrid"
+        },
+        {
+          "label": "cloud-only - klassisches Cloud-Polling",
+          "value": "cloud-only"
+        },
+        {
+          "label": "app-only - NIE Cloud-Poll",
+          "value": "app-only"
+        }
+      ],
+      "sm": 12,
+      "md": 6
     },
     "_header_compat": {
       "newLine": true,
@@ -176,7 +312,11 @@
       "newLine": true,
       "type": "staticText",
       "text": "Datenpunkte werden nach iobroker.tuya-Konvention angelegt: <device>.<dps-id> mit common.name = Code-Name. Bestehende Skripte/VIS-Bindings die 'tuya.0.<dev>.20' lesen koennen 1:1 auf 'fid-smartlife.0.<dev>.20' umgestellt werden. Zusaetzlich gibt es lesbare Aliase pro Geraet (on, brightness, temperature, ...) wo sinnvoll. Lokale Settings sind direkt unter dem Geraet: <dev>.ip, <dev>.noLocalConnection, <dev>.localKey, <dev>.localVersion, <dev>.localPort.",
-      "style": { "fontStyle": "italic", "marginBottom": "12px", "color": "#666" }
+      "style": {
+        "fontStyle": "italic",
+        "marginBottom": "12px",
+        "color": "#666"
+      }
     },
     "_header_debug": {
       "newLine": true,
@@ -189,7 +329,8 @@
       "type": "checkbox",
       "label": "Debug-Logging aktivieren",
       "help": "Zusaetzliche Debug-Meldungen. Loglevel muss auf 'debug' stehen.",
-      "sm": 12, "md": 4
+      "sm": 12,
+      "md": 4
     }
   }
 }

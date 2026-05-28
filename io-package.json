@@ -1,8 +1,100 @@
 {
   "common": {
     "name": "fid-smartlife",
-    "version": "0.7.9",
+    "version": "0.10.8",
     "news": {
+      "0.10.8": {
+        "de": "v0.10.8: Fix ECONNRESET-Crash bei Internet-Ausfall.\nWenn das DSL/Internet kurz weg ist (z.B. nachts Zwangstrennung), brach eine laufende TLS-Verbindung zur Tuya-Cloud ab. Der unterliegende TLS-Socket wirft dann 'read ECONNRESET' (TLSWrap.onStreamRead) - ein Late-Error der NICHT von req.on('error') gefangen wurde -> uncaughtException -> Adapter terminated (code 6).\nDrei Fixes:\n(1) tuyaCloud.js: req.on('socket') Handler haengt error-Listener     direkt an den TLS-Socket (eine Ebene tiefer als req).\n(2) mqttMini.js: permanenter no-op error-Listener im Constructor -     EventEmitter.emit('error') crasht sonst wenn kein Listener da     ist (passiert bei Reconnect/cleanup).\n(3) mqttMini.js: socket.destroy() im error-Handler stoppt weitere     Late-Reads auf dem toten Socket.\nDer Pulsar (Tuya Push) haelt eine dauerhafte TLS-Verbindung, war daher der wahrscheinliche Ausloeser beim DSL-Ausfall.",
+        "en": "v0.10.8: fix ECONNRESET crash on internet outage (TLS socket late errors)."
+      },
+      "0.10.7": {
+        "de": "v0.10.7: Pro-Device-Schalter '_noCloudWrite' fuer NO-Cloud-Fallback.\nProblem: Wenn Tuya-Cloud-Quota erschoepft ist (z.B. nach App-Cloud-Mass-Refresh), wird bei jedem lokalen Schreibfehler ein Cloud-Versuch unternommen der dann auch fehlschlaegt - verbrennt Quota fuer Devices die wirklich Cloud brauchen.\nLoesung: Neuer State pro Device:\n  fid-smartlife.0.<deviceId>._noCloudWrite (boolean, default false)\nWenn true: bei lokalem Schreibfehler KEIN Cloud-Versuch. Statt-\ndessen: Log-Warning + State localLastResult, Schreiben gibt Fehler\nzurueck. User kann dann selber entscheiden ob er es spaeter nochmal versuchen will.\nSinnvoll fuer Devices die zuverlaessig im LAN sind (Rollladen, Schalter im Haus, etc) wo Cloud nur Backup waere das man eh nicht braucht.\nBestehender _noCloudStatusPoll bleibt unveraendert.",
+        "en": "v0.10.7: per-device _noCloudWrite switch to disable cloud-write fallback."
+      },
+      "0.10.6": {
+        "de": "v0.10.6: ECHTER FIX fuer tuyapi-Crash gefunden.\nBug-Root-Cause: tuyaLocal35.js hat im finally-Block removeAllListeners('error') aufgerufen. Wenn tuyapi DANACH noch einen Late-Error emit-tet (z.B. timeout 5s nach disconnect), ist kein Listener mehr da -> Node.js wirft uncaughtException -> ioBroker js-controller terminated den Adapter.\nFix: removeAllListeners-Aufruf entfernt. Der error-Listener bleibt fuer die Lebenszeit des TuyaDevice-Objects registriert. Garbage-Collector raeumt auf wenn das Object gedroppt wird. Kein Memory-Leak. Process-level uncaughtException-Handler aus v0.10.5 bleibt als zweite Absicherung drin.",
+        "en": "v0.10.6: real fix for tuyapi crash - keep error listener alive."
+      },
+      "0.10.5": {
+        "de": "v0.10.5: process-Handler garantiert vor allen requires registriert.\nv0.10.3+v0.10.4 hatten den Handler im Constructor - tuyapi konnte trotzdem crashen weil require('./lib/tuyaLocal35') VOR dem Constructor laeuft. Plus: 'Error from socket' wurde im uncaughtException-Event vermutlich BEVOR der Handler greifen konnte schon zu adapter-termination weitergereicht.\nFix: Handler steht jetzt als allererstes in main.js, vor allen require() Aufrufen. Plus: erweitertes Pattern (auch 'Emitted error event on TuyaDevice' aus dem Stack-Trace).\nWenn dieser Build immer noch crashed -> Rollback auf v0.9.3.",
+        "en": "v0.10.5: process handler registered before all requires."
+      },
+      "0.10.4": {
+        "de": "v0.10.4: HOTFIX fuer v0.10.3 - 'connection timed out' wurde nicht gefangen weil mein Pattern nur 'ETIMEDOUT' kannte (Code) nicht die Message-Form. Plus: der re-throw fuer 'unbekannte' Errors hat den Adapter trotzdem gecrashed (was den ganzen Sinn des Handlers konterkariert).\nFixes:\n(1) Pattern-Liste erweitert: 'connection timed out', 'connection     refused/reset', 'socket hang up', 'ENETUNREACH', 'ENOTFOUND'.\n(2) Stack-Trace-Check: alles aus tuyapi/index.js wird     gefiltert (zusaetzliche Sicherheit).\n(3) Echte unerwartete Errors werden nur noch GELOGGT, nicht     weitergeworfen. Adapter bleibt am Leben.\n(4) Plus unhandledRejection-Handler analog.\nUse-Case: AP-Restart, WLAN-Glitch, OTA-Update der Devices - Adapter ueberlebt das jetzt.",
+        "en": "v0.10.4: hotfix - broader socket-error filter, no more re-throw."
+      },
+      "0.10.3": {
+        "de": "v0.10.3: Process-Level Schutz vor tuyapi-Crashes.\nv0.10.2's error-Listener im Wrapper reichte nicht - tuyapi-Lib emit-t Socket-Errors auf einem internen Object das wir nicht erreichen. 8 Crashes in 90min beobachtet.\nFix: globaler process.on('uncaughtException') filtert genau die harmlosen tuyapi-Socket-Errors (EHOSTUNREACH/ECONNREFUSED/etc) und ignoriert sie. Alles andere wird weitergeleitet und crasht den Adapter wie normal.",
+        "en": "v0.10.3: process-level guard against tuyapi crashes."
+      },
+      "0.10.2": {
+        "de": "v0.10.2: 2 KRITISCHE BUGS gefixt.\nBug 1: ensureLocalStates hat bei jedem Adapter-Start localVersion ueberschrieben auf '3.3' - egal was der User vorher gesetzt hat. Fix: Default wird nur geschrieben wenn der State noch wirklich leer ist (cur.val undefined/null/'').\nBug 2: tuyapi-Library wirft uncaught exceptions wenn Device offline (EHOSTUNREACH) - Adapter crashed komplett. Fix: error-Listener wird registriert BEVOR connect() aufgerufen wird. Plus: aufraeumen via removeAllListeners('error') im finally-Block.",
+        "en": "v0.10.2: 2 critical bug fixes (state overwrite, uncaught exception)."
+      },
+      "0.10.1": {
+        "de": "v0.10.1: Auto-Version-Probe wenn v3.3 alle 4 Tries timeout-t.\nHintergrund: Tuya-Devices koennen per OTA-Update auf v3.4 oder v3.5 upgegradet werden, ohne dass das gemerkt wird. Bei Bernd war die Battletron Light Bar 2 BB inzwischen v3.5, lokales Schalten ging nicht mehr (Crypto-Mismatch -> timeout).\nLoesung: Wenn alle 4 v3.3-Tries timeouten (nicht EHOSTUNREACH, das waere echtes Netz-Problem), probieren wir einmalig v3.5 und dann v3.4. Wenn einer klappt: localVersion wird permanent aktualisiert, kein erneuter Probe noetig.",
+        "en": "v0.10.1: auto-detect v3.4/v3.5 when v3.3 keeps timing out."
+      },
+      "0.10.0": {
+        "de": "v0.10.0: Lokaler Support fuer Tuya Protocol v3.4 und v3.5.\nUrsache des heutigen Light Bar 2 BB Problems: Device ist seit OTA-Update auf Protocol v3.5 (statt 3.3 wie wir dachten). Unser v3.3-Crypto-Code -> Timeout. Dazu noch 4 Floodlights auf v3.4.\nAenderungen:\n(1) Neue lib/tuyaLocal35.js als Wrapper um tuyapi-npm-Library     (handhabt v3.4 und v3.5 Crypto/Handshake).\n(2) Routing in main.js: v3.3 = eigene Implementation, v3.4/3.5 = tuyapi-Lib.\n(3) Import aus tuya.0: ueberschreibt jetzt localVersion=3.3 wenn     Tuya-Adapter eine neuere Protocol-Version meldet (z.B. nach OTA).\n(4) Migration-Filter aufgeweitet damit v3.4/3.5 Devices auch lokal     polln und nicht permanent auf cloud-only stehen.\nNeue Dependency: tuyapi@^7.5.2 (8000+ Github-Stars, gepflegt, auch von Apollon77 im offiziellen iobroker.tuya genutzt).",
+        "en": "v0.10.0: local support for Tuya v3.4 and v3.5 via tuyapi library."
+      },
+      "0.9.3": {
+        "de": "v0.9.3: ROOT-CAUSE-FIX gefunden!\nProblem: Heute Morgen hat der alte 3x-Failover-Schwellwert die Light Bar 2 BB (und vermutlich weitere Devices) PERMANENT auf cloud-only umgestellt - nur weil sie kurz WLAN-Probleme hatten. Auch nach Standortwechsel wurde noLocalConnection nicht resetted.\nFixes:\n(1) Failover-Schwelle von 3x auf 10x pro Stunde (3 war fragil).\n(2) Auto-Recovery: wenn LAN-Discovery ein Device sieht das auf     cloud-only steht, wird noLocalConnection automatisch zurueckgesetzt.\n(3) Migration V092: alle aktuell auf cloud-only stehenden Devices     werden einmalig zurueckgesetzt (Reaktivierung von lokalem Polling).\nResultat: Light Bar 2 BB sollte jetzt wieder lokal schalten (an neuem Standort mit excellent WLAN).",
+        "en": "v0.9.3: root-cause fix - failover threshold + auto-recovery + migration."
+      },
+      "0.9.2": {
+        "de": "v0.9.2: DIAGNOSE-Logging fuer Local-Pfad auf INFO-Level.\nJeder Local-Write-Versuch wird jetzt geloggt:\n  'Local Write Start fuer X -> IP:PORT dps={...}'\n  'Local Try #1 fuer X: OK/FAIL (ms, reason)'\nDamit sehen wir endlich was wirklich passiert (canLocal-Check, wie viele Tries, welche Fehler).\nPlus: canLocal=false wird mit Begruendung geloggt.",
+        "en": "v0.9.2: diagnostic logging for local path."
+      },
+      "0.9.1": {
+        "de": "v0.9.1: HOTFIX fuer v0.9.0 - Initial-Status hing.\nProblem in 0.9.0: 3 Poll-Tries + 10 Write-Tries blockierten den Adapter-Loop. Initial-Status fuer 96 Devices brauchte potentiell >30min.\nFix:\n(1) Poll back to 1 Try - bei 60s Cycle sind Retries sinnlos.\n(2) Write reduziert von 10 auf 4 Tries (Worst-Case 20s statt 45s).\n(3) Initial-Status jetzt parallel (maxParallelPolls workers, default 3).\nDamit: Initial-Status in ~2-3min statt >30min. Write klappt bei excellent WLAN trotzdem in 1. Try - Retries nur bei Wackeligkeit.",
+        "en": "v0.9.1: hotfix - initial status was hanging due to over-aggressive retries."
+      },
+      "0.9.0": {
+        "de": "v0.9.0: Robusteres lokales Schreiben fuer wackelige WLAN-Devices.\nHintergrund: Battletron Light Bar 2 BB (und aehnliche Devices) haben schwachen WLAN-Empfang, sind aber prinzipiell schaltbar wenn man oft genug versucht.\nAenderungen:\n(1) Local-Write: 10 Tries statt 3 (gestaffelte Pausen 0/0.3/    0.7/1/1.5/2/2/3/3/5s, Timeouts 5-8s).\n(2) App-Cloud-offline-Fallback: 10 Tries lokal vor Cloud-Skip.\n(3) Poll-queryStatus: 3 Tries statt 1 (gestaffelte Pausen).\n(4) Default localTimeoutMs erhoeht von 2500ms auf 5000ms.\nWorst-Case-Schaltdauer: ~45s (vorher ~11s). Bei 95% der Devices kein Unterschied (1. Try erfolgreich). Adapter-Loop bleibt async, kein Blocking.",
+        "en": "v0.9.0: more robust local writes - 10 retries for weak-wifi devices."
+      },
+      "0.8.9": {
+        "de": "v0.8.9: Targeted-Debug-Command.\nNeuer State commands.debugDeviceId: wenn da eine Device-ID drinsteht und testAppCloud=true getriggert wird, kommt vollstaendiger Detail-Output fuer DAS Device. Damit koennen wir gezielt Devices wie Battletron Light Bar 2 BB analysieren wo das Online-Erkennung versagt.\nAblauf:\n  iobroker state set fid-smartlife.0.commands.debugDeviceId 'bf4fe16...'\n  iobroker state set fid-smartlife.0.commands.testAppCloud true\n-> Log zeigt moduleMap, dps, local-Info, etc.",
+        "en": "v0.8.9: targeted debug command for single device analysis."
+      },
+      "0.8.8": {
+        "de": "v0.8.8: 'Falsch-offline' Schutz + Diagnose.\nProblem in v0.8.7: einige Devices melden im App-Cloud-Cache offline obwohl sie online sind und gesteuert werden koennen (z.B. via Tuya-App). Folge: Adapter blockierte den Cloud-Write und das Device blieb unsteuerbar.\nFix v0.8.8:\n(1) Wenn App-Cloud offline meldet UND Device hat IP+key+v3.3,     versuchen wir EINMAL lokal zu senden. Erfolg -> kein     Cloud-Write noetig.\n(2) _appCloudMirrorAllDps respektiert lokalen Erfolg: wenn     Device in den letzten 90s lokal erreichbar war, wird der     online-State NICHT auf false gesetzt (lokal ueberstimmt).\n(3) Poll setzt online=false nur wenn nicht localOk im Cycle.\n(4) commands.testAppCloud listet jetzt alle als offline     erkannten Devices mit moduleMap-Detail - so finden wir     Devices wo unsere Online-Heuristik versagt.",
+        "en": "v0.8.8: false-offline protection - try local even if appCloud says offline."
+      },
+      "0.8.7": {
+        "de": "v0.8.7: App-Cloud als primaere Status-Quelle + Cloud-Poll-Skip.\n(Phase A) pollDevice() ueberspringt Cloud-Poll fuer Devices die laut App-Cloud offline sind - spart Cloud-Quota.\n(Phase B) Nach jedem App-Cloud-Refresh werden die dps in unsere States gespiegelt via mirrorStatusDps(). Das ersetzt Cloud-Polling fuer online-Devices komplett.\nNeues Setting cloudPollMode (default: auto):\n  - auto: kein Cloud-Poll wenn App-Cloud aktiv\n  - hybrid: 1x/Stunde Cloud-Cross-Check (empfohlen)\n  - cloud-only: alter Code-Pfad (Cloud-Poll wie immer)\n  - app-only: nie Cloud-Poll\nErwartung: bei 96 Devices ~95% weniger Cloud-Polls/Stunde wenn appCloudEnabled+hybrid aktiv. Damit kein Pool-Quota-Hit mehr auch bei 07:00-Rolladen-Burst.",
+        "en": "v0.8.7: app-cloud as primary read source - skip cloud polls."
+      },
+      "0.8.6": {
+        "de": "v0.8.6: App-Cloud Online-Check vor Cloud-Writes.\nHauptfeature: Wenn appCloudEnabled=true und Smart-Life Email/Passwort gesetzt sind, holt der Adapter alle 5min (konfig via appCloudRefreshSec) den Online-Status aller Geraete via Smart-Life-App-API. Vor jedem Cloud-Write wird gecheckt ob das Device laut App-API ueberhaupt online ist. Wenn nein -> Write skip, keine Cloud-Quota-Verschwendung.\nOnline-Detection: moduleMap.wifi.isOnline aus der App-API (das ist der echte Online-Indikator).\nSession-Persistenz: sid wird in _appCloud.session State gespeichert. Beim Restart kein Re-Login solange Session <29 Tage alt. Damit nur SELTEN 'neues Geraet angemeldet' Notification in der Smart-Life-App.\nAuto-Relogin bei Auth-Fehler.\nDefault OFF - Adapter laeuft unveraendert. Erst aktivieren in Admin Settings nach Test mit commands.testAppCloud.",
+        "en": "v0.8.6: app-cloud online check before cloud writes + session persist."
+      },
+      "0.8.5": {
+        "de": "v0.8.5: App-Cloud Sondierung Step 3.\n- Test-Code zeigt jetzt 3 Devices (erstes + ein lokal erreichbares + ein nicht erreichbares) zum direkten Vergleich\n- Felder devAttribute (binaer), runtimeEnv, activeTime, dpMaxTime, virtual werden ausgegeben - so finden wir wo der online-Status wirklich steht\n- Heuristik: dpMaxTime < 5min = wahrscheinlich online\n- Match-Bug gefixt: this.devices ist ein Map, nicht Object\n- Guard gegen Doppel-Trigger (war 2x Login wegen fid-bridge   State-Spiegelung)\n- Vergleich App-Cloud-Devices vs. unsere LAN-Discoverer-Treffer",
+        "en": "v0.8.5: app-cloud sondierung 3 - online detection heuristic + match fix + dedup."
+      },
+      "0.8.4": {
+        "de": "v0.8.4: App-Cloud Sondierung Step 2 - mehr Details.\nDer Test gibt jetzt ALLE Felder des ersten Devices im Log aus damit wir sehen wie die Smart-Life-API Online-Status, Version und localKey wirklich nennt. Ausserdem Online-Statistik ueber alle Devices und korrekter Match-Vergleich mit unseren bekannten fid-smartlife Devices.",
+        "en": "v0.8.4: App-Cloud sondierung step 2 - more details for first device + online stats."
+      },
+      "0.8.3": {
+        "de": "v0.8.3: App-Cloud Sondierung (Step 1).\nNeue Library lib/tuyaAppCloud.js die Login ueber die Smart-Life-App-API macht (statt eigenes Tuya IoT Project). Damit waere kein 'controllable device pool quota' Limit mehr noetig.\nNeue Adapter-Settings: appCloudEmail, appCloudPassword, appCloudRegion (EU/US/CN/IN).\nNeuer Command-State: commands.testAppCloud = true triggert Login + Device-Listing ins Log.\nSTATUS: NUR READ-ONLY SONDIERUNG. Schreibbefehle gehen weiterhin ueber den bestehenden Cloud/Local-Pfad. Wenn der Test funktioniert, koennen wir in v0.9.0 den App-Cloud-Pfad als optionale primaere Quelle fuer Discovery+Writes nutzen.\nNeue Dependency: @tuyapi/cloud@^0.6.2 (registriert).",
+        "en": "v0.8.3: App-Cloud sondierung step 1 (login + device listing, read-only)."
+      },
+      "0.8.2": {
+        "de": "v0.8.2: Cloud-Quota-Handling verbessert.\n- 'controllable device pool quota is insufficient' wird jetzt   als separates Tagesquota erkannt (6h Pause statt 60min).   Vermeidet Spam-Calls die das Quota nie zurueckbekommen lassen.\n- Bei Cloud-Quota-Fehler probieren wir nochmal LOKAL   (wenn v3.3 + IP + key da). Vorher gabs hard fail.\n- Cloud-Status-Polling ist jetzt auch ueber den Throttle (500ms gap).   Vorher konnten Reads das Quota fressen ohne Limit.\nHinweis bei Cloud-Pool-Quota: das ist Tuya's Account-Tagesquota - Loesungen sind (1) Local-Steuerung priorisieren, (2) Tuya IoT Project upgraden, (3) Devices auf separate Projekte verteilen.",
+        "en": "v0.8.2: better cloud quota handling - detect pool quota separately, try local fallback."
+      },
+      "0.8.1": {
+        "de": "v0.8.1: Bugfix zu 0.8.0 - files-Liste war zu restriktiv (mqttMini.js, colorTools.js, enhanced.js, lanDiscovery.js fehlten im npm-Tarball -> MODULE_NOT_FOUND beim Start). Jetzt komplettes lib/ Verzeichnis im Package, die 31MB schema.json wird wie geplant nur als schema.json.gz (2.3MB) ausgeliefert.",
+        "en": "v0.8.1: include missing lib/ helpers in npm tarball."
+      },
+      "0.8.0": {
+        "de": "v0.8.0: Pre-Publish Vorbereitung fuer npm-Registry.\n- files-Liste in package.json: nur admin/, lib/, main.js, io-package.json, LICENSE, README.md werden gepackt.\n- extIcon URL auf fiducerion-GitHub gesetzt (vorher Platzhalter USER).\n- scripts.test als Stub, license/keywords/bugs ergaenzt.\n- LICENSE-Datei (MIT) hinzugefuegt.\nKeine funktionalen Aenderungen am Adapter-Code.",
+        "en": "v0.8.0: pre-publish cleanup for npm."
+      },
       "0.7.9": {
         "de": "v0.7.9: Logo-Icon in der README ergaenzt.",
         "en": "v0.7.9: Added logo icon to README."
@@ -134,7 +226,7 @@
     "main": "main.js",
     "icon": "fid-smartlife.png",
     "enabled": true,
-    "extIcon": "https://raw.githubusercontent.com/USER/iobroker.fid-smartlife/main/admin/fid-smartlife.png",
+    "extIcon": "https://raw.githubusercontent.com/fiducerion/ioBroker.fid-smartlife/main/admin/fid-smartlife.png",
     "readme": "https://github.com/fiducerion/ioBroker.fid-smartlife/blob/main/README.md",
     "loglevel": "info",
     "mode": "daemon",
@@ -177,8 +269,14 @@
     "enableLanDiscovery": true,
     "enablePulsar": false,
     "importLocalFromTuyaAdapter": true,
-    "localTimeoutMs": 2500,
-    "debug": false
+    "localTimeoutMs": 5000,
+    "debug": false,
+    "appCloudEmail": "",
+    "appCloudPassword": "",
+    "appCloudRegion": "EU",
+    "appCloudEnabled": false,
+    "appCloudRefreshSec": 300,
+    "cloudPollMode": "auto"
   },
   "protectedNative": [
     "clientSecret"
@@ -289,6 +387,32 @@
         "read": true,
         "write": true,
         "def": false
+      },
+      "native": {}
+    },
+    {
+      "_id": "commands.testAppCloud",
+      "type": "state",
+      "common": {
+        "role": "button",
+        "name": "Test App-Cloud Login (read-only sondierung)",
+        "type": "boolean",
+        "read": true,
+        "write": true,
+        "def": false
+      },
+      "native": {}
+    },
+    {
+      "_id": "commands.debugDeviceId",
+      "type": "state",
+      "common": {
+        "role": "text",
+        "name": "Device-ID fuer testAppCloud Detail-Output (leer = Listing)",
+        "type": "string",
+        "read": true,
+        "write": true,
+        "def": ""
       },
       "native": {}
     }

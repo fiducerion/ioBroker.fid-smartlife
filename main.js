@@ -21,10 +21,55 @@
  */
 'use strict';
 
+// === KRITISCH: process-level Error-Handler MUSS vor allen requires registriert werden ===
+// tuyapi-Library emit-t Errors auf internen Socket-Objects die wir mit normalem
+// try/catch nicht zuverlaessig fangen koennen. Wenn ein v3.4/v3.5-Device offline
+// ist (EHOSTUNREACH, connection timed out, etc.), crashed sonst der ganze Adapter.
+//
+// Wir registrieren den Handler hier ganz am Anfang, vor allen require()s, damit er
+// garantiert aktiv ist bevor tuyapi geladen werden kann.
+if (!global._fidSmartlifeSocketErrorHandlerInstalled) {
+  global._fidSmartlifeSocketErrorHandlerInstalled = true;
+
+  const isSocketError = (err) => {
+    const msg = String(err && err.message || err);
+    const stack = String(err && err.stack || '');
+    return (
+      /Error from socket/i.test(msg) ||
+      /EHOSTUNREACH|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EPIPE|ENETUNREACH|ENOTFOUND|ECONNABORTED/i.test(msg) ||
+      /connection timed out|connection refused|connection reset|socket hang up/i.test(msg) ||
+      /read ECONNRESET|write EPIPE/i.test(msg) ||
+      /tuyapi[\/\\]index\.js/i.test(stack) ||
+      /TuyaDevice instance/i.test(stack) ||
+      /Emitted 'error' event on TuyaDevice/i.test(stack)
+    );
+  };
+
+  process.on('uncaughtException', (err) => {
+    if (isSocketError(err)) {
+      // Silent ignore - harmlos. Device ist offline oder WLAN flackert.
+      return;
+    }
+    // Echte unerwartete Errors NUR loggen, NICHT re-throwen.
+    // Re-throw waere "korrekt" macht aber den Adapter unbenutzbar.
+    try {
+      console.error('[fid-smartlife] uncaughtException (non-socket):', err);
+    } catch (e) { /* ignore */ }
+  });
+
+  process.on('unhandledRejection', (reason) => {
+    if (isSocketError(reason)) return;
+    try {
+      console.error('[fid-smartlife] unhandledRejection (non-socket):', reason);
+    } catch (e) { /* ignore */ }
+  });
+}
+
 const utils      = require('@iobroker/adapter-core');
 const TuyaCloud  = require('./lib/tuyaCloud');
 const TuyaPulsar = require('./lib/tuyaPulsar').TuyaPulsar;
 const tuyaLocal  = require('./lib/tuyaLocal');
+const tuyaLocal35 = require('./lib/tuyaLocal35');  // v3.4 + v3.5 via tuyapi-lib
 const lanDiscovery = require('./lib/lanDiscovery');
 const sm         = require('./lib/specMapper');
 const enhanced   = require('./lib/enhanced');
@@ -42,6 +87,11 @@ class FiducerionSmartlife extends utils.Adapter {
     this.cloud = null;
     this.pulsar = null;
     this.pulsarStats = { msgRx: 0, decryptOk: 0, decryptFail: 0, lastMsgTs: 0 };
+
+    /** TuyaAppCloud (Smart-Life Email/Password Login) - v0.8.6 */
+    this.appCloud = null;
+    this.appCloudTimer = null;
+    this._appCloudTestRunning = false;
 
     /** Map deviceId -> { name, defs, alias, dpMeta, canonToReal, noCloudStatusPoll, local, raw } */
     this.devices = new Map();
@@ -63,6 +113,26 @@ class FiducerionSmartlife extends utils.Adapter {
     this.pollTimer    = null;
     this.rediscoverTimer = null;
     this.shuttingDown = false;
+  }
+
+  /**
+   * Liefert die richtige Local-Implementation basierend auf der Protocol-Version.
+   * - v3.3 -> eigene Implementation (lib/tuyaLocal.js)
+   * - v3.4 / v3.5 -> via tuyapi-Library (lib/tuyaLocal35.js)
+   */
+  _getLocalImpl(version) {
+    const v = String(version || '3.3');
+    if (v === '3.4' || v === '3.5') return tuyaLocal35;
+    return tuyaLocal;
+  }
+
+  /**
+   * True wenn die Protocol-Version lokal unterstuetzt wird.
+   * Aktuell: 3.3 (eigen) + 3.4 + 3.5 (via tuyapi).
+   */
+  _isLocalVersionSupported(version) {
+    const v = String(version || '3.3');
+    return v === '3.3' || v === '3.4' || v === '3.5';
   }
 
   async onReady() {
@@ -157,6 +227,10 @@ class FiducerionSmartlife extends utils.Adapter {
       // auf false und nutzt den neuen smarten Failover (temporaer, 5min).
       await this.migrateResetFailoverV065();
 
+      // Migration v0.9.2: Reset aller heute akkumulierter Cloud-Only-Flags
+      // wegen zu aggressivem 3x-Schwellwert. v0.9.2 hat jetzt 10x + Auto-Recovery.
+      await this.migrateResetFailoverV092();
+
       // Periodisches Polling
       const pollMs = Math.max(10, Number(cfg.pollIntervalSec) || 60) * 1000;
       this.pollTimer = this.setInterval(() => this.pollAll().catch(e => this.log.warn('Poll-Cycle: ' + e.message)), pollMs);
@@ -177,6 +251,16 @@ class FiducerionSmartlife extends utils.Adapter {
       if (cfg.enablePulsar) {
         await this.startPulsar(secret).catch(e =>
           this.log.warn('Pulsar-Start fehlgeschlagen (Adapter laeuft normal weiter): ' + (e.message || e))
+        );
+      }
+
+      // ---- App-Cloud (Smart-Life Email/Password) (v0.8.6) ----
+      // Wenn aktiviert: nutzt Smart-Life-App-API als zusaetzliche Status-Quelle.
+      // Hauptzweck heute: Online-Check vor Cloud-Write damit wir keine
+      // Cloud-Quota fuer offline Devices verschwenden.
+      if (cfg.appCloudEnabled && cfg.appCloudEmail && cfg.appCloudPassword) {
+        await this.startAppCloud().catch(e =>
+          this.log.warn('App-Cloud-Start fehlgeschlagen (Adapter laeuft normal weiter): ' + (e.message || e))
         );
       }
 
@@ -241,6 +325,7 @@ class FiducerionSmartlife extends utils.Adapter {
       if (this.rediscoverTimer) { this.clearInterval(this.rediscoverTimer); this.rediscoverTimer = null; }
       if (this.lanListener) { try { this.lanListener.stop(); } catch (e) {} this.lanListener = null; }
       if (this.pulsar) { try { this.pulsar.stop(); } catch (e) {} this.pulsar = null; }
+      if (this.appCloudTimer) { this.clearInterval(this.appCloudTimer); this.appCloudTimer = null; }
       // Alle ausstehenden Debounce-Timer clearen
       for (const k of Object.keys(this.writeTimers)) {
         try { clearTimeout(this.writeTimers[k]); } catch (e) {}
@@ -275,14 +360,19 @@ class FiducerionSmartlife extends utils.Adapter {
         this.log.warn('Legacy-Cleanup: ' + (e && e.message || e));
       }
 
-      // Initial-Poll fuer alle frisch geladenen Geraete
+      // Initial-Poll fuer alle frisch geladenen Geraete (parallel um nicht ewig zu brauchen)
       this.log.info('Initial-Status holen ...');
-      let n = 0;
-      for (const id of this.devices.keys()) {
-        if (this.shuttingDown) return;
-        try { await this.pollDevice(id); n++; }
-        catch (e) { /* schon geloggt in pollDevice */ }
-      }
+      const initIds = Array.from(this.devices.keys());
+      const initParallel = Math.max(1, Math.min(5, Number(this.config.maxParallelPolls) || 3));
+      let n = 0, i = 0;
+      const initWorkers = Array.from({ length: initParallel }, () => (async () => {
+        while (i < initIds.length && !this.shuttingDown) {
+          const idx = i++;
+          try { await this.pollDevice(initIds[idx]); n++; }
+          catch (e) { /* schon geloggt in pollDevice */ }
+        }
+      })());
+      await Promise.all(initWorkers);
       this.log.info('Initial-Status: ' + n + '/' + this.devices.size + ' OK');
 
     } catch (e) {
@@ -393,6 +483,16 @@ class FiducerionSmartlife extends utils.Adapter {
       name: 'Disable regular cloud status polling',
       type: 'boolean', role: 'switch', read: true, write: true
     });
+    // v0.10.7: Pro-Device-Schalter um Cloud-Write-Fallback zu deaktivieren.
+    // Wenn true: bei Local-Fail wird KEIN Cloud-Versuch unternommen (spart
+    // Cloud-Quota fuer Devices die wirklich auf Cloud angewiesen sind).
+    // Sinnvoll fuer Devices die zuverlaessig lokal erreichbar sein SOLLTEN
+    // (z.B. Rollladen, Schalter im Haus). Default: false (= alte Behaviour).
+    await this.ensureState(id + '._noCloudWrite', {
+      name: 'Disable cloud-write fallback when local fails',
+      type: 'boolean', role: 'switch', read: true, write: true,
+      desc: 'Wenn true: bei lokalen Schreibfehlern kein Cloud-Fallback. Spart Quota.'
+    });
 
     await this.setStateAsync(id + '._name', { val: name, ack: true });
     // online wird NICHT mehr aus raw.online (Cloud-Online) gesetzt - das passiert
@@ -475,8 +575,16 @@ class FiducerionSmartlife extends utils.Adapter {
       type: 'state',
       common: Object.assign({ name: id, read: true, write: false }, common),
       native: {}
-    }).then(() => {
-      if (typeof value !== 'undefined') return this.setStateAsync(deviceId + '.' + id, { val: value, ack: true });
+    }).then(async () => {
+      // value ist Default - nur schreiben wenn State noch keinen Wert hat.
+      // Vorher wurde IMMER geschrieben -> localVersion=3.5 wurde bei jedem
+      // Adapter-Start auf 3.3 zurueckgesetzt!
+      if (typeof value !== 'undefined') {
+        const cur = await this.getStateAsync(deviceId + '.' + id).catch(() => null);
+        if (!cur || cur.val === undefined || cur.val === null || cur.val === '') {
+          await this.setStateAsync(deviceId + '.' + id, { val: value, ack: true });
+        }
+      }
     });
 
     await def('ip',                 { type: 'string',  role: 'info.ip',          write: true });
@@ -504,6 +612,8 @@ class FiducerionSmartlife extends utils.Adapter {
     const noLocal           = !!(await v('noLocalConnection', false));
     const preferLocal       = !noLocal;
     const source            = String(await v('localSource', ''));
+    // v0.10.7: pro-Device "kein Cloud-Write-Fallback" Schalter
+    const noCloudWrite      = !!(await v('_noCloudWrite', false));
 
     // Falls ip aus raw kam aber State noch leer ist: setzen
     if (rawIp && tuyaLocal.isPrivateIp(rawIp)) {
@@ -513,7 +623,7 @@ class FiducerionSmartlife extends utils.Adapter {
       }
     }
 
-    return { ip, key, version, port, preferLocal, source };
+    return { ip, key, version, port, preferLocal, source, noCloudWrite };
   }
 
   async ensureState(id, common) {
@@ -683,7 +793,7 @@ class FiducerionSmartlife extends utils.Adapter {
         const lc = dev.local || {};
         if (!lc.ip || !lc.key) continue;
         if (!tuyaLocal.isPrivateIp(lc.ip)) continue;
-        if (lc.version !== '3.3') continue;
+        if (lc.version !== '3.3' && lc.version !== '3.4' && lc.version !== '3.5') continue;
         // Nur Devices wo noLocalConnection aktuell true ist
         const cur = await this.getStateAsync(id + '.noLocalConnection').catch(() => null);
         if (cur && cur.val === true) {
@@ -815,6 +925,175 @@ class FiducerionSmartlife extends utils.Adapter {
   }
 
   /**
+   * Startet die App-Cloud-Anbindung (v0.8.6).
+   * - Laedt persistierte Session aus _appCloudSession state falls vorhanden
+   * - Fuehrt initialen fetchAll() durch
+   * - Startet periodischen Refresh
+   * - Persistiert sid nach erfolgreichem Login
+   */
+  async startAppCloud() {
+    const cfg = this.config;
+    const { TuyaAppCloud } = require('./lib/tuyaAppCloud');
+
+    // Persistierte Session laden
+    let savedSid = null, savedTs = 0;
+    try {
+      const st = await this.getStateAsync('_appCloud.session').catch(() => null);
+      if (st && st.val && typeof st.val === 'string') {
+        const obj = JSON.parse(st.val);
+        if (obj && obj.sid && obj.lastLoginTs) {
+          savedSid = obj.sid;
+          savedTs  = obj.lastLoginTs;
+          const ageH = Math.round((Date.now() - savedTs) / 3600000);
+          this.log.info('App-Cloud: persistierte Session geladen (Alter: ' + ageH + 'h)');
+        }
+      }
+    } catch (e) { /* ignore */ }
+
+    this.appCloud = new TuyaAppCloud({
+      email:    cfg.appCloudEmail,
+      password: cfg.appCloudPassword,
+      region:   cfg.appCloudRegion || 'EU',
+      sid:      savedSid,
+      lastLoginTs: savedTs,
+      logger:   (lvl, msg) => this.log[lvl] && this.log[lvl](msg)
+    });
+
+    // Initial fetch
+    try {
+      const t0 = Date.now();
+      await this.appCloud.fetchAll();
+      const stats = this.appCloud.getCachedStats();
+      this.log.info('App-Cloud: Initial-Fetch OK (' + (Date.now() - t0) + 'ms): ' +
+                    stats.total + ' Devices, ' + stats.online + ' online, ' + stats.offline + ' offline');
+      await this._appCloudPersistSession();
+      await this._appCloudUpdateInfoStates(stats);
+      // v0.8.7: Auch direkt die dps spiegeln (App-Cloud als Status-Quelle)
+      await this._appCloudMirrorAllDps();
+    } catch (e) {
+      this.log.warn('App-Cloud Initial-Fetch fehlgeschlagen: ' + (e.message || e));
+      const msg = String(e.message || e).toLowerCase();
+      if (msg.includes('auth') || msg.includes('login') || msg.includes('password')) {
+        await this.setStateAsync('_appCloud.session', { val: '', ack: true }).catch(()=>{});
+      }
+      return;
+    }
+
+    // Periodischer Refresh
+    const refreshSec = Math.max(60, Number(cfg.appCloudRefreshSec) || 300);
+    this.appCloudTimer = this.setInterval(async () => {
+      try {
+        await this.appCloud.fetchAll();
+        const stats = this.appCloud.getCachedStats();
+        await this._appCloudUpdateInfoStates(stats);
+        // v0.8.7: Auch direkt die dps spiegeln - bei aktivem app-Modus die einzige Status-Quelle
+        await this._appCloudMirrorAllDps();
+        this.log.debug('App-Cloud Refresh: ' + stats.online + '/' + stats.total + ' online, dps gespiegelt');
+      } catch (e) {
+        this.log.warn('App-Cloud Refresh: ' + (e.message || e));
+      }
+    }, refreshSec * 1000);
+    this.log.info('App-Cloud aktiv (Refresh alle ' + refreshSec + 's). Online-Check vor Cloud-Write ist eingeschaltet.');
+  }
+
+  /**
+   * v0.8.7: spiegelt die aktuellen dps-Werte aus der App-Cloud in unsere States.
+   * Das ist quasi gratis (App-Cloud-Fetch war eh schon gemacht) und ersetzt
+   * fuer online-Devices den Cloud-Poll komplett.
+   *
+   * Wird nach jedem App-Cloud-Fetch aufgerufen.
+   */
+  async _appCloudMirrorAllDps() {
+    if (!this.appCloud || !this.appCloud._lastFetchDevices) return;
+    let mirrored = 0, skippedOffline = 0, skippedUnknown = 0, kept = 0;
+    const now = Date.now();
+    for (const [did, devData] of this.appCloud._lastFetchDevices) {
+      const dev = this.devices.get(did);
+      if (!dev) { skippedUnknown++; continue; }
+      const isOnline = this.appCloud.isDeviceOnline(devData);
+      // online-State pflegen - aber: wenn lokal in den letzten 90s gesehen (Hysterese
+      // wegen Auto-Failover etc), nicht ueberschreiben mit appCloud-offline.
+      // _lastLocalOk wird in pollDevice() gesetzt bei localOk-Erfolg.
+      const lastLocalOk = dev._lastLocalOk || 0;
+      const recentLocalOk = (now - lastLocalOk) < 90 * 1000;
+      if (isOnline) {
+        await this.setStateAsync(did + '.online', { val: true, ack: true }).catch(() => {});
+      } else if (recentLocalOk) {
+        // App-Cloud meint offline aber wir hatten gerade lokal Erfolg
+        // -> online lassen (lokal ueberstimmt)
+        kept++;
+      } else {
+        await this.setStateAsync(did + '.online', { val: false, ack: true }).catch(() => {});
+      }
+      if (!isOnline) { skippedOffline++; continue; }
+      if (!devData.dps || typeof devData.dps !== 'object') continue;
+      try {
+        await this.mirrorStatusDps(dev, devData.dps);
+        mirrored++;
+      } catch (e) {
+        this.log.debug('App-Cloud mirror ' + dev.name + ': ' + e.message);
+      }
+    }
+    this.log.debug('App-Cloud mirror: ' + mirrored + ' dps gespiegelt, ' +
+                   skippedOffline + ' offline-skip, ' + kept + ' kept-online (lokal frisch), ' +
+                   skippedUnknown + ' unbekannt');
+  }
+
+  async _appCloudPersistSession() {
+    if (!this.appCloud || !this.appCloud.sid) return;
+    try {
+      await this.setObjectNotExistsAsync('_appCloud.session', {
+        type: 'state',
+        common: { name: 'App-Cloud Session (JSON)', type: 'string', role: 'json', read: true, write: false },
+        native: {}
+      });
+      await this.setStateAsync('_appCloud.session', {
+        val: JSON.stringify({
+          sid:         this.appCloud.sid,
+          lastLoginTs: this.appCloud.lastLoginTs
+        }),
+        ack: true
+      });
+    } catch (e) { /* ignore */ }
+  }
+
+  async _appCloudUpdateInfoStates(stats) {
+    try {
+      await this.setObjectNotExistsAsync('_appCloud.online', {
+        type: 'state',
+        common: { name: 'App-Cloud: Anzahl online Devices', type: 'number', role: 'value', read: true, write: false, def: 0 },
+        native: {}
+      });
+      await this.setObjectNotExistsAsync('_appCloud.offline', {
+        type: 'state',
+        common: { name: 'App-Cloud: Anzahl offline Devices', type: 'number', role: 'value', read: true, write: false, def: 0 },
+        native: {}
+      });
+      await this.setObjectNotExistsAsync('_appCloud.lastFetch', {
+        type: 'state',
+        common: { name: 'App-Cloud: letzter Fetch', type: 'string', role: 'date', read: true, write: false },
+        native: {}
+      });
+      await this.setStateAsync('_appCloud.online',     { val: stats.online,  ack: true });
+      await this.setStateAsync('_appCloud.offline',    { val: stats.offline, ack: true });
+      await this.setStateAsync('_appCloud.lastFetch',  { val: new Date(stats.fetchedAt).toISOString(), ack: true });
+    } catch (e) { /* ignore */ }
+  }
+
+  /**
+   * Online-Check fuer ein Device. Liefert:
+   *   true  = wahrscheinlich online (App-Cloud sagt so)
+   *   false = wahrscheinlich offline (App-Cloud sagt offline)
+   *   null  = App-Cloud nicht aktiv oder Device unbekannt -> nicht entscheidbar
+   */
+  appCloudIsOnline(devId) {
+    if (!this.appCloud || !this.appCloud._lastFetchDevices) return null;
+    const info = this.appCloud.getDeviceInfo(devId);
+    if (!info) return null;
+    return info.online;
+  }
+
+  /**
    * Migration v0.6.5: Reset aller akkumulierten Auto-Failover-Flags.
    * In v0.6.4 hat der Failover Devices DAUERHAFT cloud-only gemacht.
    * v0.6.5 hat smartere temporaere Failover-Logik - daher einmal alles zurueck.
@@ -839,7 +1118,7 @@ class FiducerionSmartlife extends utils.Adapter {
         const lc = dev.local || {};
         if (!lc.ip || !lc.key) continue;
         if (!tuyaLocal.isPrivateIp(lc.ip)) continue;
-        if (lc.version !== '3.3') continue;
+        if (lc.version !== '3.3' && lc.version !== '3.4' && lc.version !== '3.5') continue;
         const cur = await this.getStateAsync(id + '.noLocalConnection').catch(() => null);
         if (cur && cur.val === true) {
           await this.setStateAsync(id + '.noLocalConnection', { val: false, ack: true });
@@ -854,6 +1133,50 @@ class FiducerionSmartlife extends utils.Adapter {
       this.log.info('Migration V065: ' + reset + ' Geraete Auto-Failover-Flag zurueckgesetzt (lokales Polling reaktiviert)');
     } catch (e) {
       this.log.warn('migrateResetFailoverV065: ' + e.message);
+    }
+  }
+
+  /**
+   * Migration v0.9.2: Reset aller permanent-Cloud-Only-Flags.
+   * v0.6.5 hatte 3x Failover -> permanent. Das war zu aggressiv und hat Devices
+   * dauerhaft auf cloud-only umgestellt nur weil sie kurz WLAN-Hickser hatten.
+   * v0.9.2 verschiebt die Schwelle auf 10x + Auto-Recovery bei LAN-Discovery.
+   * Diese Migration setzt einmalig alle Cloud-Only-Flags zurueck.
+   */
+  async migrateResetFailoverV092() {
+    try {
+      const marker = await this.getStateAsync('info.localResetV092').catch(() => null);
+      if (marker && marker.val === true) {
+        this.log.debug('Migration V092 schon erledigt - skip');
+        return;
+      }
+      await this.setObjectNotExistsAsync('info.localResetV092', {
+        type: 'state',
+        common: { name: 'Migration v0.9.2 Failover-Reset done', type: 'boolean', role: 'indicator', read: true, write: false, def: false },
+        native: {}
+      });
+
+      let reset = 0;
+      for (const id of this.devices.keys()) {
+        const dev = this.devices.get(id);
+        const lc = dev.local || {};
+        if (!lc.ip || !lc.key) continue;
+        if (!tuyaLocal.isPrivateIp(lc.ip)) continue;
+        if (lc.version !== '3.3' && lc.version !== '3.4' && lc.version !== '3.5') continue;
+        const cur = await this.getStateAsync(id + '.noLocalConnection').catch(() => null);
+        if (cur && cur.val === true) {
+          await this.setStateAsync(id + '.noLocalConnection', { val: false, ack: true });
+          dev.local.preferLocal = true;
+          dev._localFailCount = 0;
+          dev._cloudOnlyUntil = 0;
+          dev._failoverHourCount = 0;
+          reset++;
+        }
+      }
+      await this.setStateAsync('info.localResetV092', { val: true, ack: true });
+      this.log.info('Migration V092: ' + reset + ' Geraete Failover-Flag zurueckgesetzt (waren auf cloud-only durch alten 3x-Schwellwert)');
+    } catch (e) {
+      this.log.warn('migrateResetFailoverV092: ' + e.message);
     }
   }
 
@@ -899,15 +1222,19 @@ class FiducerionSmartlife extends utils.Adapter {
     const now = Date.now();
     const inTempCloudMode = (dev._cloudOnlyUntil || 0) > now;
 
-    if (preferLocal && !inTempCloudMode && ip && key && version === '3.3') {
+    if (preferLocal && !inTempCloudMode && ip && key && (version === '3.3' || version === '3.4' || version === '3.5')) {
       try {
-        const res = await tuyaLocal.queryStatus({
+        // v0.9.1: Poll bleibt knapp - 1 Try mit normalem Timeout.
+        // v0.10.0: Routing nach Protocol-Version (3.3=eigene Impl, 3.4/3.5=tuyapi-lib)
+        const pollTimeout = Math.max(2500, Number(this.config.localTimeoutMs) || 5000);
+        const impl = this._getLocalImpl(version);
+        const res = await impl.queryStatus({
           ip: ip,
           localKey: key,
           deviceId: id,
-          version: '3.3',
+          version: version,
           port: port,
-          timeoutMs: 2500
+          timeoutMs: pollTimeout
         });
         if (res && res.ok && res.dps) {
           await this.mirrorStatusDps(dev, res.dps);
@@ -951,13 +1278,16 @@ class FiducerionSmartlife extends utils.Adapter {
             // Counter NICHT mehr resetten - wir wollen ja den >=50 Schwellenwert
             // fuer die Online-Hysterese behalten. Failover bleibt unabhaengig.
 
-            if (dev._failoverHourCount > 3) {
+            if (dev._failoverHourCount > 10) {
+              // v0.9.2: war 3 - viel zu aggressiv. 10 Fails in 1h ist plausibler
+              // fuer ein wirklich kaputtes Device, nicht nur kurze WLAN-Hickser.
+              // Plus: Recovery erfolgt automatisch wenn Device wieder LAN-Broadcasts sendet.
               await this.setStateAsync(id + '.noLocalConnection', { val: true, ack: true }).catch(() => {});
               dev.local.preferLocal = false;
-              this.log.info('Auto-Failover (permanent): ' + dev.name + ' (' + id + ') 3x Failover in 1h - cloud-only');
+              this.log.info('Auto-Failover (permanent): ' + dev.name + ' (' + id + ') 10x Failover in 1h - cloud-only');
             } else {
               dev._cloudOnlyUntil = now + 5 * 60 * 1000;
-              this.log.debug('Auto-Failover (temp 5min): ' + dev.name + ' - lokal mehrfach gescheitert');
+              this.log.debug('Auto-Failover (temp 5min): ' + dev.name + ' - lokal mehrfach gescheitert (' + dev._failoverHourCount + '/10)');
             }
           }
         }
@@ -974,12 +1304,47 @@ class FiducerionSmartlife extends utils.Adapter {
         // Stilles skip - wir loggen den Quota-Status zentral im sendDeviceCommands
         return;
       }
+      // v0.8.7: Wenn App-Cloud aktiv und Device als offline gemeldet -> kein Cloud-Call
+      if (this.appCloud && this.config.appCloudEnabled) {
+        const online = this.appCloudIsOnline(id);
+        if (online === false) {
+          // Device offline laut App-Cloud - Cloud-Poll waere Quota-Verschwendung.
+          // ABER: nur die online-State setzen wenn wir auch wirklich KEINE lokale
+          // Erreichbarkeit haben. Wenn localOk in diesem Cycle ueberstimmt sowieso.
+          if (!localOk) {
+            await this.setStateAsync(id + '.online', { val: false, ack: true }).catch(() => {});
+          }
+          return;
+        }
+        // v0.8.7: Wenn App-Cloud aktiv UND online: Cloud-Poll meist NICHT noetig
+        // weil App-Cloud-Refresh die dps schon spiegelt. Wir polln Cloud nur noch
+        // im Hybrid-Mode 1x/Stunde fuer Cross-Check.
+        const mode = this.config.cloudPollMode || 'auto';
+        if (online === true && (mode === 'auto' || mode === 'app-only')) {
+          // App-Cloud hat bereits gespiegelt. Skip Cloud-Poll.
+          return;
+        }
+        if (online === true && mode === 'hybrid') {
+          // 1x/Stunde Cloud-Cross-Check
+          const lastCross = dev._lastCloudCrossCheck || 0;
+          const HOUR_MS = 60 * 60 * 1000;
+          if ((Date.now() - lastCross) < HOUR_MS) {
+            // Noch innerhalb der Stunde - skip
+            return;
+          }
+          dev._lastCloudCrossCheck = Date.now();
+          this.log.debug('Hybrid: Cloud-Cross-Check fuer ' + dev.name);
+        }
+        // mode === 'cloud-only' faellt durch zum normalen Cloud-Poll
+      }
       try {
+        // Auch Read-Polls zaehlen ins Quota - throttlen wie Writes
+        await this._cloudThrottleWait();
         const status = await this.cloud.getStatus(id);
         await this.mirrorStatus(dev, status);
         // online: nur fuer Battery/Sub-Devices (kein lokaler Pfad moeglich) aus Cloud.
         // Bei normalen WiFi-Devices wird .online im lokalen Pfad gesetzt (Hysterese).
-        const hasLocalCapability = !!(localCfg.ip && localCfg.key && version === '3.3');
+        const hasLocalCapability = !!(localCfg.ip && localCfg.key && this._isLocalVersionSupported(version));
         if (!hasLocalCapability && typeof dev.raw.online !== 'undefined') {
           await this.setStateAsync(id + '.online', { val: !!dev.raw.online, ack: true }).catch(() => {});
         }
@@ -989,6 +1354,15 @@ class FiducerionSmartlife extends utils.Adapter {
           dev.noCloudStatusPoll = true;
           await this.setStateAsync(id + '._noCloudStatusPoll', { val: true, ack: true }).catch(() => {});
           this.log.warn('Cloud status poll deaktiviert fuer ' + dev.name + ' (' + id + '): function not support');
+          return;
+        }
+        if (msg.includes('controllable device pool') || msg.includes('quota is insufficient')) {
+          // Account-Tagesquota - 6h Pause, sonst spammen wir Tuya weiter
+          this._cloudQuotaPausedUntil = Date.now() + 6 * 60 * 60 * 1000;
+          this._lastQuotaWarnTs = Date.now();
+          await this.setStateAsync('info.cloudQuotaPaused', { val: true, ack: true }).catch(() => {});
+          this.log.warn('Cloud-Pool-Quota erschoepft beim Polling: ' + (e.message || e) +
+            '. Pausiert fuer 6h. Hinweis: Tuya Account-Tagesquota - Local-Steuerung priorisieren.');
           return;
         }
         if (msg.includes('quota') || msg.includes('exceeded') || msg.includes('rate limit')) {
@@ -1276,6 +1650,89 @@ class FiducerionSmartlife extends utils.Adapter {
       })();
       return;
     }
+    if (id === this.namespace + '.commands.testAppCloud') {
+      await this.setStateAsync(id, { val: false, ack: true });
+      if (this._appCloudTestRunning) { return; }
+      this._appCloudTestRunning = true;
+      this.log.info('=== App-Cloud Test ===');
+      (async () => {
+        try {
+          const cfg = this.config;
+          if (!cfg.appCloudEmail || !cfg.appCloudPassword) {
+            this.log.warn('App-Cloud Test: email/password fehlen');
+            return;
+          }
+          // Schauen ob ein Debug-Device gesetzt ist
+          const debugDevIdState = await this.getStateAsync('commands.debugDeviceId').catch(() => null);
+          const debugDevId = debugDevIdState && debugDevIdState.val ? String(debugDevIdState.val).trim() : '';
+
+          if (!this.appCloud) {
+            this.log.warn('App-Cloud nicht aktiv - aktiviere appCloudEnabled erst');
+            return;
+          }
+
+          this.log.info('Force-Refresh App-Cloud...');
+          await this.appCloud.fetchAll();
+          const stats = this.appCloud.getCachedStats();
+          this.log.info('Nach Refresh: ' + stats.total + ' Devices, ' + stats.online + ' online, ' + stats.offline + ' offline');
+
+          if (debugDevId) {
+            // Targeted Debug fuer ein Device
+            const d = this.appCloud._lastFetchDevices.get(debugDevId);
+            if (!d) {
+              this.log.warn('Device-ID ' + debugDevId + ' nicht in App-Cloud-Cache!');
+              return;
+            }
+            this.log.info('--- DEBUG Device "' + d.name + '" (' + debugDevId + ') ---');
+            this.log.info('  productId    : ' + d.productId);
+            this.log.info('  category     : ' + d.category + ' (' + d.categoryCode + ')');
+            this.log.info('  devAttribute : ' + d.devAttribute + ' (bin: ' + (d.devAttribute || 0).toString(2) + ')');
+            this.log.info('  isDeviceOnline (unser Check): ' + this.appCloud.isDeviceOnline(d));
+            this.log.info('  moduleMap (RAW JSON): ' + JSON.stringify(d.moduleMap || {}));
+            this.log.info('  dps          : ' + JSON.stringify(d.dps).substring(0, 300));
+            this.log.info('  activeTime   : ' + d.activeTime + ' (' + (d.activeTime ? new Date(d.activeTime * 1000).toISOString() : '-') + ')');
+            this.log.info('  dpMaxTime    : ' + d.dpMaxTime);
+            this.log.info('  localKey     : ' + d.localKey);
+            this.log.info('  ip           : ' + d.ip);
+            this.log.info('  mac          : ' + d.mac);
+            this.log.info('  virtual      : ' + d.virtual);
+            this.log.info('  runtimeEnv   : ' + d.runtimeEnv);
+            // Plus: was wissen WIR ueber das Device?
+            const ourDev = this.devices.get(debugDevId);
+            if (ourDev) {
+              this.log.info('  --- Unser Device-Cache ---');
+              this.log.info('    local.ip      : ' + (ourDev.local && ourDev.local.ip));
+              this.log.info('    local.key     : ' + (ourDev.local && ourDev.local.key));
+              this.log.info('    local.version : ' + (ourDev.local && ourDev.local.version));
+              this.log.info('    local.preferLocal : ' + (ourDev.local && ourDev.local.preferLocal));
+              this.log.info('    _lastLocalOk  : ' + (ourDev._lastLocalOk ? new Date(ourDev._lastLocalOk).toISOString() : 'never'));
+            }
+            this.log.info('--- ENDE ---');
+          } else {
+            // Listing aller offline Devices
+            const offlineDetails = [];
+            for (const [did, devData] of this.appCloud._lastFetchDevices) {
+              if (this.appCloud.isDeviceOnline(devData)) continue;
+              const m = devData.moduleMap || {};
+              const isOnlinePerModule = {};
+              for (const k of Object.keys(m)) isOnlinePerModule[k] = m[k] ? m[k].isOnline : 'n/a';
+              offlineDetails.push({ devId: did, name: devData.name, mods: isOnlinePerModule });
+            }
+            this.log.info('--- OFFLINE laut isDeviceOnline (' + offlineDetails.length + ') ---');
+            for (const od of offlineDetails.slice(0, 25)) {
+              this.log.info('  ' + od.name + ' (' + od.devId + ') online=' + JSON.stringify(od.mods));
+            }
+            this.log.info('Tipp: setze commands.debugDeviceId="<devId>" und triggere testAppCloud erneut fuer Detail-Output.');
+          }
+          this.log.info('=== App-Cloud Test fertig ===');
+        } catch (e) {
+          this.log.error('App-Cloud Test FAIL: ' + (e && e.message || e));
+        } finally {
+          this._appCloudTestRunning = false;
+        }
+      })();
+      return;
+    }
 
     // Path zerlegen: fid-smartlife.0.<deviceId>.<code>
     const prefix = this.namespace + '.';
@@ -1425,7 +1882,16 @@ class FiducerionSmartlife extends utils.Adapter {
 
     // Vorab-Check: ohne IP+key+v3.3 hat lokaler Versuch keine Chance.
     // Damit sparen wir den Timeout-Roundtrip + sofort-Cloud-Fallback.
-    const canLocal = !!(dev.local.preferLocal && dev.local.ip && dev.local.key && dev.local.version === '3.3');
+    const canLocal = !!(dev.local.preferLocal && dev.local.ip && dev.local.key && this._isLocalVersionSupported(dev.local.version));
+    if (!canLocal) {
+      // Diagnose-Log: warum nicht
+      const why = [];
+      if (!dev.local.preferLocal) why.push('preferLocal=false');
+      if (!dev.local.ip)          why.push('no ip');
+      if (!dev.local.key)         why.push('no key');
+      if (!this._isLocalVersionSupported(dev.local.version)) why.push('version=' + dev.local.version + ' nicht unterstuetzt');
+      this.log.info('canLocal=false fuer ' + dev.name + ': ' + why.join(', ') + ' - direkt Cloud-Pfad');
+    }
 
     if (canLocal) {
       // dpsMap: dpId-String -> value
@@ -1439,25 +1905,34 @@ class FiducerionSmartlife extends utils.Adapter {
 
       if (!allDpsKnown) {
         await this.setStateAsync(dev.id + '.localLastResult', { val: 'local skipped: no dpId mapping', ack: true });
+        this.log.info('Local skipped fuer ' + dev.name + ': no dpId mapping fuer mindestens einen Code');
         // Fallthrough auf Cloud
       } else {
         // 3 lokale Versuche bevor wir Cloud nehmen. Erste Versuch mit normalem
         // Timeout. Wenn 1. fail: 200ms warten, dann nochmal mit 1.5x Timeout.
         // Wenn 2. fail: 500ms warten, 2x Timeout. Erst dann Cloud.
-        // Bei Blink-Scripts (alle 3s) haben wir so 3 Chancen pro Schaltakt.
-        const baseTimeout = Number(this.config.localTimeoutMs) || 2500;
+        // v0.9.1: 4 Tries (war 3 vorher, 10 in 0.9.0 war zu aggressiv).
+        // Worst-Case: 4 × 5s = 20s. Bei excellent WiFi: 1. Try erfolgreich (<500ms).
+        // Schnelles Blinken (3s-Zyklen) braucht <1s Latenz - das geht nur wenn
+        // Local sofort klappt. Worst-Case Failover zu Cloud nach 20s ist OK.
+        const baseTimeout = Number(this.config.localTimeoutMs) || 5000;
         const tries = [
-          { delayBeforeMs: 0,   timeoutMs: baseTimeout },
-          { delayBeforeMs: 200, timeoutMs: Math.round(baseTimeout * 1.5) },
-          { delayBeforeMs: 500, timeoutMs: baseTimeout * 2 }
+          { delayBeforeMs: 0,    timeoutMs: baseTimeout },              // 0s -> 5s
+          { delayBeforeMs: 300,  timeoutMs: baseTimeout },              // 0.3s -> 5s
+          { delayBeforeMs: 700,  timeoutMs: Math.round(baseTimeout * 1.2) }, // 1s -> 6s
+          { delayBeforeMs: 1500, timeoutMs: Math.round(baseTimeout * 1.4) }  // 1.5s -> 7s
         ];
+        this.log.info('Local Write Start fuer ' + dev.name + ' -> ' + dev.local.ip + ':' + dev.local.port + ' dps=' + JSON.stringify(dpsMap));
         let lastReason = 'unknown';
+        const tStart = Date.now();
         for (let i = 0; i < tries.length; i++) {
           const t = tries[i];
           if (t.delayBeforeMs > 0) {
             await new Promise(r => setTimeout(r, t.delayBeforeMs));
           }
-          const r = await tuyaLocal.sendCommand({
+          const tTry = Date.now();
+          const implWrite = this._getLocalImpl(dev.local.version);
+          const r = await implWrite.sendCommand({
             ip:        dev.local.ip,
             localKey:  dev.local.key,
             deviceId:  dev.id,
@@ -1466,26 +1941,147 @@ class FiducerionSmartlife extends utils.Adapter {
             port:      dev.local.port,
             timeoutMs: t.timeoutMs
           });
+          const tDur = Date.now() - tTry;
+          this.log.info('Local Try #' + (i + 1) + ' fuer ' + dev.name + ' (v' + dev.local.version + '): ' + (r.ok ? 'OK' : 'FAIL') + ' (' + tDur + 'ms, reason: ' + (r.reason || '-') + ')');
           if (r.ok) {
-            const note = (i === 0) ? 'local ok' : ('local ok (retry ' + i + ')');
+            const totalMs = Date.now() - tStart;
+            const note = (i === 0) ? 'local ok' : ('local ok (retry ' + i + ', ' + totalMs + 'ms)');
             await this.setStateAsync(dev.id + '.localLastResult', { val: note, ack: true });
-            if (i > 0) this.log.debug('Local write ' + dev.name + ' OK at retry ' + i);
             return;   // Erfolg - kein Cloud-Versuch
           }
           lastReason = r.reason;
         }
-        await this.setStateAsync(dev.id + '.localLastResult', { val: 'local fail after 3 tries: ' + lastReason, ack: true });
-        this.log.debug('Local failed for ' + dev.name + ' after 3 tries (' + lastReason + ') - falling back to cloud');
+        // Alle 4 Tries failed. Wenn aktuelle Version 3.3 und alle Tries
+        // timeout (nicht ENETUNREACH/EHOSTUNREACH/ECONNREFUSED, das wäre
+        // Netzwerk-Problem): vermutlich hat das Device per OTA auf v3.4
+        // oder v3.5 upgegradet. Probieren wir 1x mit v3.5, dann 1x mit v3.4.
+        // Wenn einer der beiden klappt: localVersion permanent updaten.
+        const onlyTimeouts = lastReason && /^timeout$/i.test(String(lastReason));
+        if (dev.local.version === '3.3' && onlyTimeouts) {
+          for (const probeVer of ['3.5', '3.4']) {
+            this.log.info('Auto-Version-Probe ' + dev.name + ': versuche v' + probeVer + ' (v3.3 hat ' + lastReason + ')');
+            try {
+              const probeImpl = this._getLocalImpl(probeVer);
+              const pr = await probeImpl.sendCommand({
+                ip:        dev.local.ip,
+                localKey:  dev.local.key,
+                deviceId:  dev.id,
+                dpsMap:    dpsMap,
+                version:   probeVer,
+                port:      dev.local.port,
+                timeoutMs: 5000
+              });
+              if (pr.ok) {
+                this.log.info('Auto-Version-Probe ' + dev.name + ': v' + probeVer + ' OK - localVersion permanent aktualisiert');
+                await this.setStateAsync(dev.id + '.localVersion', { val: probeVer, ack: true });
+                dev.local.version = probeVer;
+                await this.setStateAsync(dev.id + '.localLastResult', { val: 'local ok (auto-probe v' + probeVer + ')', ack: true });
+                return;  // Erfolg
+              }
+            } catch (eProbe) { /* try next */ }
+          }
+        }
+
+        await this.setStateAsync(dev.id + '.localLastResult', { val: 'local fail after 4 tries: ' + lastReason, ack: true });
+        const totalMs = Date.now() - tStart;
+        // v0.10.7: Wenn _noCloudWrite=true gesetzt ist, KEIN Cloud-Fallback.
+        // Spart Cloud-Quota fuer Devices die nur Cloud-Only funktionieren.
+        if (dev.local && dev.local.noCloudWrite) {
+          this.log.warn('Local FAIL fuer ' + dev.name + ' nach 4 Tries / ' + totalMs + 'ms (' + lastReason + ') - KEIN Cloud-Fallback (_noCloudWrite=true)');
+          await this.setStateAsync(dev.id + '.localLastResult', { val: 'local fail, no cloud fallback (_noCloudWrite=true): ' + lastReason, ack: true });
+          throw new Error('local fail + no cloud fallback: ' + lastReason);
+        }
+        this.log.info('Local FAIL fuer ' + dev.name + ' nach 4 Tries / ' + totalMs + 'ms (' + lastReason + ') - fallback zu Cloud');
       }
     } else if (dev.local.preferLocal && !dev.local.ip) {
-      // IP fehlt komplett - kein lokaler Versuch, aber wir warnen damit man's sieht
+      // IP fehlt komplett - kein lokaler Versuch
+      if (dev.local.noCloudWrite) {
+        // v0.10.7: kein Cloud-Fallback - direkt aufgeben
+        this.log.warn(dev.name + ': keine lokale IP und _noCloudWrite=true - Schreiben abgebrochen');
+        await this.setStateAsync(dev.id + '.localLastResult', { val: 'no local ip + no cloud fallback (_noCloudWrite=true)', ack: true });
+        throw new Error('no local ip + no cloud fallback');
+      }
       await this.setStateAsync(dev.id + '.localLastResult', { val: 'no local ip - direct cloud', ack: true });
-    } else if (dev.local.preferLocal && dev.local.version !== '3.3') {
-      // v3.4 etc - aktuell kein lokaler Support, direkt Cloud
+    } else if (dev.local.preferLocal && !this._isLocalVersionSupported(dev.local.version)) {
+      // Andere Versionen (z.B. 3.1 oder Sub-Devices) - kein lokaler Support, direkt Cloud
+      if (dev.local.noCloudWrite) {
+        // v0.10.7: kein Cloud-Fallback
+        this.log.warn(dev.name + ': Version ' + dev.local.version + ' nicht lokal unterstuetzt und _noCloudWrite=true - Schreiben abgebrochen');
+        await this.setStateAsync(dev.id + '.localLastResult', { val: 'unsupported version + no cloud fallback (_noCloudWrite=true)', ack: true });
+        throw new Error('unsupported version + no cloud fallback');
+      }
       await this.setStateAsync(dev.id + '.localLastResult', { val: 'version ' + dev.local.version + ' not supported locally - direct cloud', ack: true });
     }
 
     // Cloud-Pfad: mit Quota-Guard + globalem Throttle (v0.6.5)
+    // PLUS v0.8.6: App-Cloud Online-Check. Wenn App-Cloud sagt das Device ist
+    // offline -> Cloud-Write skippen (waere eh Fehler + verbrennt Quota).
+    // v0.8.8: Aber NUR wenn Device auch nicht lokal erreichbar ist.
+    if (this.config.appCloudEnabled && this.appCloud) {
+      const onlineStatus = this.appCloudIsOnline(dev.id);
+      if (onlineStatus === false) {
+        // Device laut App-Cloud offline. Aber moeglicherweise lokal noch da
+        // (App-Cloud-Cache ist 5min alt, oder moduleMap-Heuristik versagt).
+        // Wir geben dem lokalen Pfad eine letzte Chance falls IP+key+v3.3 da.
+        const hasLocalCapability = !!(dev.local && dev.local.ip && dev.local.key && this._isLocalVersionSupported(dev.local.version));
+        if (hasLocalCapability && dev.local.preferLocal !== false) {
+          this.log.debug('App-Cloud meldet ' + dev.name + ' offline, aber local moeglich - versuche lokal (10 retries)');
+          // dpsMap fuer Local-Versuch bauen
+          const dpsMap = {};
+          let allDpsKnown = true;
+          for (const p of pairs) {
+            const meta = dev.dpMeta[p.codeCanon];
+            if (!meta || !meta.dpId) { allDpsKnown = false; break; }
+            dpsMap[meta.dpId] = p.value;
+          }
+          if (allDpsKnown) {
+            // v0.9.1: 4 Tries (war 10, blockiert Adapter zu lang)
+            const baseTimeout = Number(this.config.localTimeoutMs) || 5000;
+            const tries = [
+              { delay: 0,    to: baseTimeout },
+              { delay: 300,  to: baseTimeout },
+              { delay: 700,  to: Math.round(baseTimeout * 1.2) },
+              { delay: 1500, to: Math.round(baseTimeout * 1.4) }
+            ];
+            const tStart = Date.now();
+            let lastReason = 'unknown';
+            for (let i = 0; i < tries.length; i++) {
+              const t = tries[i];
+              if (t.delay > 0) await new Promise(r => setTimeout(r, t.delay));
+              try {
+                const implAcfb = this._getLocalImpl(dev.local.version);
+                const r = await implAcfb.sendCommand({
+                  ip:        dev.local.ip,
+                  localKey:  dev.local.key,
+                  deviceId:  dev.id,
+                  dpsMap:    dpsMap,
+                  version:   dev.local.version,
+                  port:      dev.local.port || 6668,
+                  timeoutMs: t.to
+                });
+                if (r && r.ok) {
+                  const totalMs = Date.now() - tStart;
+                  await this.setStateAsync(dev.id + '.localLastResult', { val: 'local ok (appCloud-offline fallback, retry ' + i + ', ' + totalMs + 'ms)', ack: true });
+                  await this.setStateAsync(dev.id + '.online', { val: true, ack: true });
+                  this.log.info('Local-Fallback erfolgreich fuer ' + dev.name + ' nach ' + (i + 1) + ' Versuchen / ' + totalMs + 'ms (App-Cloud sagte offline)');
+                  return;
+                }
+                lastReason = r.reason || 'unknown';
+              } catch (eLoc) {
+                lastReason = eLoc.message;
+              }
+            }
+            this.log.debug('Local fallback failed for ' + dev.name + ' after 4 tries: ' + lastReason);
+          }
+        }
+        // Lokal auch nicht moeglich/erfolgreich -> wirklich skippen
+        const msg = 'App-Cloud meldet Device offline - Cloud-Write skipped';
+        this.log.warn('Cloud-Write ' + dev.name + ' uebersprungen: ' + msg);
+        await this.setStateAsync(dev.id + '.localLastResult', { val: msg, ack: true }).catch(() => {});
+        await this.setStateAsync(dev.id + '.online', { val: false, ack: true }).catch(() => {});
+        throw new Error(msg);
+      }
+    }
     await this._cloudThrottleWait();
     if (this._cloudQuotaPausedUntil && Date.now() < this._cloudQuotaPausedUntil) {
       const minLeft = Math.ceil((this._cloudQuotaPausedUntil - Date.now()) / 60000);
@@ -1510,13 +2106,61 @@ class FiducerionSmartlife extends utils.Adapter {
       await this.cloud.sendCommands(dev.id, cloudCmds);
     } catch (eCloud) {
       const m = String(eCloud && eCloud.message || eCloud).toLowerCase();
-      if (m.includes('quota') || m.includes('exceeded') || m.includes('rate limit')) {
-        // Tuya hat unsere Cloud-Calls dichtgemacht. 1h Backoff fuer ALLE Devices.
+      const isPoolQuota = m.includes('controllable device pool') || m.includes('quota is insufficient');
+      const isRateLimit = m.includes('quota') || m.includes('exceeded') || m.includes('rate limit');
+
+      if (isPoolQuota) {
+        // "Controllable device pool quota" - das ist Tuya's Account-Tagesquota,
+        // NICHT ein 1h-Rate-Limit. Reset erfolgt im 24h-Sliding-Window. Wir machen
+        // 6h Pause damit wir nicht alle 60min wieder in den selben Fehler laufen.
+        // Plus: log mit Hinweis dass User Account-Upgrade braucht.
+        this._cloudQuotaPausedUntil = Date.now() + 6 * 60 * 60 * 1000;
+        this._lastQuotaWarnTs = Date.now();
+        await this.setStateAsync('info.cloudQuotaPaused', { val: true, ack: true }).catch(() => {});
+        this.log.warn('Cloud-Pool-Quota erschoepft (' + (eCloud.message || eCloud) +
+          '). Cloud-Writes fuer 6h pausiert. Hinweis: das ist Tuya\'s Tages-Quota, ' +
+          'nicht behebbar durch Warten. Loesungen: (1) lokale Steuerung priorisieren, ' +
+          '(2) Tuya IoT Project upgraden, (3) Devices auf separate Tuya-Projekte verteilen.');
+      } else if (isRateLimit) {
+        // Klassisches Rate-Limit: 1h reicht
         this._cloudQuotaPausedUntil = Date.now() + 60 * 60 * 1000;
         this._lastQuotaWarnTs = Date.now();
         await this.setStateAsync('info.cloudQuotaPaused', { val: true, ack: true }).catch(() => {});
-        this.log.warn('Cloud-Quota erschoepft (' + (eCloud.message || eCloud) + '). Cloud-Writes pausiert fuer 60 Minuten.');
+        this.log.warn('Cloud-Rate-Limit (' + (eCloud.message || eCloud) + '). Cloud-Writes pausiert fuer 60 Minuten.');
       }
+
+      // Retry-Local: wenn Cloud quota/rate-limit und Device hat lokale Capability,
+      // versuchen wir nochmal lokal. Wir kommen hierhin nur wenn der lokale Pfad
+      // vorher entweder gar nicht versucht wurde (v3.4/3.5, kein IP) oder fehlgeschlagen
+      // ist. Bei Quota lohnt sich ein letzter lokaler Versuch besser als gar nichts.
+      if ((isPoolQuota || isRateLimit) && dev.local.preferLocal && dev.local.ip && dev.local.key && this._isLocalVersionSupported(dev.local.version)) {
+        this.log.info('Cloud quota - probiere lokal nochmal fuer ' + dev.name);
+        try {
+          const dpsMap = {};
+          for (const p of pairs) {
+            const dpId = (dev.dpMeta && dev.dpMeta[p.realCode] && dev.dpMeta[p.realCode].dpId);
+            if (!dpId) throw new Error('no dpId for ' + p.realCode);
+            dpsMap[dpId] = p.value;
+          }
+          const implRetry = this._getLocalImpl(dev.local.version);
+          const r = await implRetry.sendCommand({
+            ip:        dev.local.ip,
+            localKey:  dev.local.key,
+            deviceId:  dev.id,
+            dpsMap:    dpsMap,
+            version:   dev.local.version,
+            port:      dev.local.port,
+            timeoutMs: 5000
+          });
+          if (r.ok) {
+            await this.setStateAsync(dev.id + '.localLastResult', { val: 'local ok (cloud-quota fallback)', ack: true });
+            return;  // Geschafft - kein Fehler weiterreichen
+          }
+        } catch (eLocal) {
+          this.log.debug('Cloud-quota local-retry fail ' + dev.name + ': ' + (eLocal.message || eLocal));
+        }
+      }
+
       throw eCloud;
     }
     if (dev.local.preferLocal) {
@@ -1564,6 +2208,25 @@ class FiducerionSmartlife extends utils.Adapter {
     if (changed) {
       this.log.info('LAN-Discovery: ' + dev.name + ' -> ' + rec.ip + (rec.version ? ' v' + rec.version : ''));
     }
+
+    // v0.9.2: Recovery von permanentem Cloud-Only-Failover.
+    // Wenn ein Device wieder Broadcasts sendet (LAN-Discovery hat es gerade
+    // gesehen), war es entweder neu im Netz oder ist von schlechtem WLAN
+    // erholt. Wir resetten dann noLocalConnection=true automatisch, damit
+    // beim naechsten Write/Poll wieder lokal versucht wird.
+    try {
+      const noLocalState = await this.getStateAsync(dev.id + '.noLocalConnection').catch(() => null);
+      if (noLocalState && noLocalState.val === true) {
+        await this.setStateAsync(dev.id + '.noLocalConnection', { val: false, ack: true });
+        // In-Memory-State auch korrigieren falls dev.local schon da ist
+        if (dev.local) dev.local.preferLocal = true;
+        // Failover-Counter zuruecksetzen damit wir nicht sofort wieder reinkippen
+        dev._localFailCount = 0;
+        dev._failoverHourCount = 0;
+        dev._cloudOnlyUntil = 0;
+        this.log.info('Recovery: ' + dev.name + ' wieder via LAN sichtbar - noLocalConnection zurueck auf false');
+      }
+    } catch (e) { /* ignore */ }
   }
 
   // -------------- Message-Handler (iobroker sendto) --------------
@@ -1794,9 +2457,18 @@ class FiducerionSmartlife extends utils.Adapter {
     }
     if (version) {
       const verState = await this.getStateAsync(id + '.localVersion').catch(() => null);
-      if (!verState || !verState.val) {
+      const curVer = verState && verState.val ? String(verState.val) : '';
+      // Schreiben wenn noch leer ODER wenn Tuya eine neuere Protocol-Version
+      // angibt (z.B. nach OTA-Upgrade von 3.3 auf 3.5). Vorher wurde nur
+      // einmalig geschrieben und nie ueberschrieben - das hat zu Mismatches
+      // gefuehrt (curVer="3.3" obwohl Device inzwischen "3.5" ist).
+      const newerProto = (version === '3.4' || version === '3.5') && curVer === '3.3';
+      if (!curVer || newerProto) {
         await this.setStateAsync(id + '.localVersion', { val: version, ack: true });
         if (dev && dev.local) dev.local.version = version;
+        if (newerProto) {
+          this.log.info('Import: ' + (dev && dev.name) + ' localVersion ' + curVer + ' -> ' + version + ' (tuya.0 hat neuere Protocol-Version)');
+        }
       }
     }
     await this.setStateAsync(id + '.localSource', { val: 'tuya.0', ack: true });
